@@ -78,6 +78,33 @@ namespace Client.Main.Controllers
 
         public void PlayAnimation(ushort idx) => PlayAnimation(idx, false);
 
+        public void Reset()
+        {
+            // Cancel any running timers
+            _timer?.Cancel();
+            _timer?.Dispose();
+            _timer = null;
+
+            // Reset all state variables
+            _oneShotEnded = false;
+            _forceReturnToIdle = false;
+            _currentOneShot = null;
+            _serverControlled = false;
+
+            // Force return to idle animation
+            if (_owner.Status != GameControlStatus.Disposed)
+            {
+                ushort idle = _owner switch
+                {
+                    PlayerObject p => p.GetCorrectIdleAction(),
+                    _ => (ushort)MonsterActionType.Stop1
+                };
+
+                _owner.CurrentAction = idle;
+                _owner.InvalidateBuffers();
+            }
+        }
+
         private void StartBackupTimer(ushort idx)
         {
             if (!TryGetDuration(idx, out var real)) return;
@@ -193,17 +220,23 @@ namespace Client.Main.Controllers
         private static AnimationType GetPlayerAnimationType(PlayerAction a) => a switch
         {
             PlayerAction.PlayerDie1 or PlayerAction.PlayerDie2 => AnimationType.Death,
-            PlayerAction.PlayerStandingRest or PlayerAction.PlayerFlyingRest => AnimationType.Rest,
+            PlayerAction.PlayerPoseMale1 or PlayerAction.PlayerPose1 => AnimationType.Rest,
             PlayerAction.PlayerSit1 or PlayerAction.PlayerSitFemale1 => AnimationType.Sit,
-            PlayerAction.StopMale or PlayerAction.StopFemale or PlayerAction.StopFlying
+            PlayerAction.PlayerStopMale or PlayerAction.PlayerStopFemale or PlayerAction.PlayerStopFly
                                                                                => AnimationType.Idle,
-            PlayerAction.WalkMale or PlayerAction.WalkFemale or
-            PlayerAction.RunSwim or PlayerAction.Fly => AnimationType.Walk,
-            PlayerAction.AttackFist or PlayerAction.PlayerAttackBow or
-            PlayerAction.PlayerAttackSwordRight1 or PlayerAction.PlayerAttackCrossbow
+
+            PlayerAction.PlayerWalkMale or PlayerAction.PlayerWalkFemale or
+            PlayerAction.PlayerRunSwim or PlayerAction.PlayerFly => AnimationType.Walk,
+            PlayerAction.PlayerAttackFist or PlayerAction.PlayerAttackBow or
+            PlayerAction.PlayerAttackSwordRight1 or PlayerAction.PlayerAttackCrossbow or
+            PlayerAction.PlayerAttackScythe1 or PlayerAction.PlayerAttackScythe2 or
+            PlayerAction.PlayerAttackScythe3 or PlayerAction.PlayerAttackTwoHandSword1 or
+            PlayerAction.PlayerAttackTwoHandSword2 or PlayerAction.PlayerAttackTwoHandSword3 or
+            PlayerAction.PlayerAttackSpear1
                                                                                => AnimationType.Attack,
-            PlayerAction.BlowSkill or PlayerAction.TwistingSlashSkill or
-            PlayerAction.FlameSkill or PlayerAction.EvilSpiritSkill => AnimationType.Skill,
+
+            // PlayerAction.BlowSkill or PlayerAction.TwistingSlashSkill or
+            // PlayerAction.FlameSkill or PlayerAction.EvilSpiritSkill => AnimationType.Skill,
             PlayerAction.PlayerGreeting1 or PlayerAction.PlayerGoodbye1 or
             PlayerAction.PlayerClap1 or PlayerAction.PlayerCheer1 => AnimationType.Emote,
             _ => AnimationType.Idle

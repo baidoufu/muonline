@@ -65,7 +65,8 @@ namespace Client.Main
             _graphics = new GraphicsDeviceManager(this)
             {
                 PreferredBackBufferWidth = 1280,
-                PreferredBackBufferHeight = 720
+                PreferredBackBufferHeight = 720,
+                PreferMultiSampling = Constants.MSAA_ENABLED
             };
 
 #if ANDROID || IOS
@@ -84,6 +85,7 @@ namespace Client.Main
             }
 #endif
             _graphics.GraphicsProfile = GraphicsProfile.HiDef;
+            _graphics.PreferredBackBufferFormat = SurfaceFormat.Color;
             _graphics.ApplyChanges();
             Content.RootDirectory = "Content";
 
@@ -215,7 +217,9 @@ namespace Client.Main
             if (AppSettings == null || !ValidateSettings(AppSettings, bootLogger)) // Add validation
             {
                 bootLogger.LogCritical("❌ Invalid application settings found in appsettings.json. Shutting down.");
+#if !IOS
                 Exit(); // Stop the game if settings are invalid
+#endif
                 return;
             }
             bootLogger.LogInformation("✅ Configuration loaded.");
@@ -541,7 +545,17 @@ namespace Client.Main
         private void DrawFinalImageToScreen(RenderTarget2D sourceTarget)
         {
             GraphicsDevice.Clear(Color.Black);
-            GraphicsManager.Instance.Sprite.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend);
+
+            Effect gammaEffect = Constants.MSAA_ENABLED ? GraphicsManager.Instance.GammaCorrectionEffect : null;
+
+            GraphicsManager.Instance.Sprite.Begin(
+                SpriteSortMode.Deferred,
+                BlendState.Opaque,
+                SamplerState.LinearClamp,
+                DepthStencilState.None,
+                RasterizerState.CullNone,
+                gammaEffect);
+
             GraphicsManager.Instance.Sprite.Draw(sourceTarget, GraphicsDevice.Viewport.Bounds, Color.White);
             GraphicsManager.Instance.Sprite.End();
         }

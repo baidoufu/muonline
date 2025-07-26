@@ -271,13 +271,17 @@ namespace Client.Main.Scenes
                             msg.Closed += (s, e) =>
                             {
                                 _logger.LogInformation("Closing game after connection lost message.");
+#if !IOS
                                 MuGame.ScheduleOnMainThread(() => MuGame.Instance.Exit());
+#endif
                             };
                         }
                         else
                         {
                             _logger.LogError("Failed to show MessageWindow for connection lost. Exiting game directly.");
+#if !IOS
                             MuGame.ScheduleOnMainThread(() => MuGame.Instance.Exit());
+#endif
                         }
                     }
                 }
@@ -352,7 +356,7 @@ namespace Client.Main.Scenes
         }
 
         private void HandleCharacterListReceived(object sender,
-            List<(string Name, CharacterClassNumber Class, ushort Level)> characters)
+            List<(string Name, CharacterClassNumber Class, ushort Level, byte[] Appearance)> characters)
         {
             MuGame.ScheduleOnMainThread(() =>
             {

@@ -24,7 +24,7 @@ namespace Client.Main.Networking.PacketHandling.Handlers
         private static readonly List<(ServerMessage.MessageType Type, string Message)> _pendingServerMessages = new();
         private static readonly object _pendingServerMessagesLock = new();
         private static readonly Regex _leadingZerosRegex = new Regex(
-            @"^0+(?=[a-zA-Z])",
+            @"^0+(?=\S)",  // Remove leading zeros followed by any non-whitespace character
             RegexOptions.Compiled);
 
         // ───────────────────────── Constructors ─────────────────────────
@@ -156,8 +156,18 @@ namespace Client.Main.Networking.PacketHandling.Handlers
 
                             if (player != null)
                             {
-                                var bubble = new ChatBubbleObject(display, player.NetworkId, sender);
-                                world.Objects.Add(bubble);
+                                var existingBubble = world.Objects.OfType<ChatBubbleObject>()
+                                    .FirstOrDefault(b => b.TargetId == player.NetworkId);
+                                
+                                if (existingBubble != null)
+                                {
+                                    existingBubble.AppendMessage(display);
+                                }
+                                else
+                                {
+                                    var bubble = new ChatBubbleObject(display, player.NetworkId, sender);
+                                    world.Objects.Add(bubble);
+                                }
                             }
                         }
                     }
