@@ -1,4 +1,5 @@
 ﻿using Client.Main.Controls;
+using Client.Main.Graphics;
 using Client.Main.Objects.Player;
 using Client.Main.Objects.Worlds.Login;
 using Microsoft.Extensions.Logging;
@@ -9,12 +10,11 @@ namespace Client.Main.Worlds
 {
     public class NewLoginWorld : WorldControl
     {
-        private PlayerObject _player;
         private static readonly ILogger _logger = Microsoft.Extensions.Logging.LoggerFactory.Create(builder => { }).CreateLogger<NewLoginWorld>();
 
         public NewLoginWorld() : base(worldIndex: 95)
         {
-            _player = new PlayerObject();
+            EnableShadows = false;
             Camera.Instance.ViewFar = 50000f;
         }
 
@@ -51,7 +51,7 @@ namespace Client.Main.Worlds
         {
             base.Update(time);
 
-            if (!Visible || _player == null) return;
+            if (!Visible) return;
 
             if (MuGame.Instance.PrevKeyboard.IsKeyDown(Keys.Delete) && MuGame.Instance.Keyboard.IsKeyUp(Keys.Delete))
             {

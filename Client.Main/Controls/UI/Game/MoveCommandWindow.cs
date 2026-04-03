@@ -1,4 +1,5 @@
 using Client.Main.Controls.UI.Common;
+using Client.Main.Data;
 using Client.Main.Models;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Input;
@@ -36,7 +37,7 @@ namespace Client.Main.Controls.UI.Game
 
         private const int COL_MAP_NAME_X = 0;
         private const int COL_LEVEL_X = 105;
-        private const int COL_ZEN_X = 145; 
+        private const int COL_ZEN_X = 145;
 
 
         private LabelControl _titleLabel;
@@ -79,6 +80,7 @@ namespace Client.Main.Controls.UI.Game
 
             Visible = false;
             Interactive = true;
+            AutoViewSize = false;
 
             ControlSize = new Point(WINDOW_TARGET_WIDTH, WINDOW_TARGET_HEIGHT);
             ViewSize = ControlSize;
@@ -221,8 +223,20 @@ namespace Client.Main.Controls.UI.Game
                     ITEM_HEIGHT - 1);
                 _mapClickAreas.Add(clickArea);
 
+                int effectiveRequiredLevel = mapInfo.RequiredLevel;
+                if (playerState != null &&
+                    (playerState.Class == CharacterClassNumber.MagicGladiator || playerState.Class == CharacterClassNumber.DuelMaster ||
+                     playerState.Class == CharacterClassNumber.DarkLord || playerState.Class == CharacterClassNumber.LordEmperor ||
+                     playerState.Class == CharacterClassNumber.RageFighter || playerState.Class == CharacterClassNumber.FistMaster))
+                {
+                    if (mapInfo.RequiredLevel != 400)
+                    {
+                        effectiveRequiredLevel = (int)(mapInfo.RequiredLevel * 2.0f / 3.0f);
+                    }
+                }
+
                 Color nameColor = mapInfo.CanMove ? (mapInfo.IsSelected ? Color.Gold : Color.WhiteSmoke) : new Color(100, 100, 100);
-                Color levelColor = (playerState != null && playerState.Level >= mapInfo.RequiredLevel) ? (mapInfo.CanMove ? new Color(180, 220, 255) : new Color(90, 90, 90)) : Color.Red;
+                Color levelColor = (playerState != null && playerState.Level >= effectiveRequiredLevel) ? (mapInfo.CanMove ? new Color(180, 220, 255) : new Color(90, 90, 90)) : Color.Red;
                 Color zenColor = (playerState != null && playerState.InventoryZen >= mapInfo.RequiredZen) ? (mapInfo.CanMove ? new Color(180, 255, 180) : new Color(90, 90, 90)) : Color.Red;
                 if (mapInfo.IsStrifeMap && !mapInfo.CanMove) nameColor = new Color(120, 60, 60);
 
@@ -243,7 +257,7 @@ namespace Client.Main.Controls.UI.Game
                 {
                     X = PADDING_LEFT + COL_LEVEL_X,
                     Y = currentY,
-                    Text = mapInfo.RequiredLevel.ToString(),
+                    Text = effectiveRequiredLevel.ToString(),
                     FontSize = 9.5f,
                     TextColor = levelColor,
                     ControlSize = new Point(COL_ZEN_X - COL_LEVEL_X - 5, ITEM_HEIGHT - 1)
@@ -320,9 +334,10 @@ namespace Client.Main.Controls.UI.Game
             if (Visible)
             {
                 _logger.LogDebug("MoveCommandWindow toggled ON. Refreshing map data.");
-                LoadMapData();
                 _currentScrollOffset = 0;
-                if (_scrollBar.Visible) _scrollBar.Value = 0;
+                if (_scrollBar != null) _scrollBar.Value = 0;
+                LoadMapData();
+                BringToFront();
                 Scene.FocusControl = this;
             }
             else
@@ -343,6 +358,12 @@ namespace Client.Main.Controls.UI.Game
             if (!Visible) return;
             base.Update(gameTime);
 
+            var mouse = MuGame.Instance.UiMouseState;
+            if (IsMouseOver && (mouse.LeftButton == ButtonState.Pressed || mouse.RightButton == ButtonState.Pressed))
+            {
+                Scene?.SetMouseInputConsumed();
+            }
+
             var playerState = _networkManager.GetCharacterState();
             bool listNeedsVisualRefresh = false;
             for (int i = 0; i < _currentlyDisplayableMaps.Count; ++i)
@@ -357,7 +378,6 @@ namespace Client.Main.Controls.UI.Game
                 }
             }
 
-            var mouse = MuGame.Instance.Mouse;
             int oldHoveredMapIndex = _hoveredMapIndex;
             _hoveredMapIndex = -1;
 
@@ -366,7 +386,7 @@ namespace Client.Main.Controls.UI.Game
                 if (_mapClickAreas[i].Contains(mouse.Position))
                 {
                     _hoveredMapIndex = _currentScrollOffset + i;
-                    if (mouse.LeftButton == ButtonState.Pressed && MuGame.Instance.PrevMouseState.LeftButton == ButtonState.Released)
+                    if (mouse.LeftButton == ButtonState.Pressed && MuGame.Instance.PrevUiMouseState.LeftButton == ButtonState.Released)
                     {
                         OnMapClicked(i);
                         if (Scene is BaseScene baseScene) baseScene.SetMouseInputConsumed(); // signal consumption
@@ -413,11 +433,14 @@ namespace Client.Main.Controls.UI.Game
             if (!Visible || !IsMouseOver) // only process if visible and mouse is over this control
                 return false;
 
+            int scrollDirection = scrollDelta > 0 ? 1 : -1;
+
             if (_scrollBar != null && _scrollBar.Visible && _scrollBar.IsMouseOver)
             {
                 // if the scrollbar handles it, then the MoveCommandWindow also considers it handled.
-                if (_scrollBar.ProcessMouseScroll(scrollDelta))
+                if (_scrollBar.ProcessMouseScroll(scrollDirection))
                 {
+                    Scene?.SetMouseInputConsumed();
                     return true;
                 }
             }
@@ -429,10 +452,11 @@ namespace Client.Main.Controls.UI.Game
             // For simplicity and to prevent pass-through if the window is clearly the focus:
             if (_scrollBar != null && _scrollBar.Visible)  // a scrollbar exists, assume scroll should be for it
             {
-                _scrollBar.Value -= scrollDelta; // scrollDelta: positive for up, negative for down
+                _scrollBar.Value -= scrollDirection; // scrollDelta: positive for up, negative for down
+                Scene?.SetMouseInputConsumed();
                 return true;
             }
-            
+
             return false; // window didn't use the scroll (e.g., no scrollbar visible)
         }
 

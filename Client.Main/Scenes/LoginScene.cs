@@ -2,10 +2,11 @@
 using Client.Main.Controls.UI;
 using Client.Main.Controls.UI.Login;
 using Client.Main.Core.Client;
-using Client.Main.Core.Models;   // Add using for ServerInfo
+using Client.Main.Core.Models;   // For ServerInfo
 using Client.Main.Models;
 using Client.Main.Networking;
 using Client.Main.Worlds;
+using Client.Main.Graphics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Xna.Framework;
 using MUnique.OpenMU.Network.Packets; // Needed for CharacterClassNumber
@@ -26,6 +27,10 @@ namespace Client.Main.Scenes
         private ServerList _serverList;
         private LabelControl _statusLabel;
         private ClientConnectionState _previousStateHandled = ClientConnectionState.Initial;
+
+        private bool _previousDayNightEnabled;
+        private Vector3 _previousSunDirection;
+        private bool _dayNightPatched;
 
         private NetworkManager _networkManager;
         private ILogger<LoginScene> _logger;
@@ -63,6 +68,26 @@ namespace Client.Main.Scenes
             _serverList = null;
         }
 
+        private void DisableDayNightCycleForScene()
+        {
+            if (_dayNightPatched) return;
+
+            _dayNightPatched = true;
+            _previousDayNightEnabled = Constants.ENABLE_DAY_NIGHT_CYCLE;
+            _previousSunDirection = Constants.SUN_DIRECTION;
+            Constants.ENABLE_DAY_NIGHT_CYCLE = false;
+            SunCycleManager.ResetToDefault();
+        }
+
+        private void RestoreDayNightCycle()
+        {
+            if (!_dayNightPatched) return;
+
+            Constants.ENABLE_DAY_NIGHT_CYCLE = _previousDayNightEnabled;
+            Constants.SUN_DIRECTION = _previousSunDirection;
+            _dayNightPatched = false;
+        }
+
         // This method is now part of the new progress reporting system
         protected override async Task LoadSceneContentWithProgress(Action<string, float> progressCallback)
         {
@@ -71,6 +96,7 @@ namespace Client.Main.Scenes
             // World Loading is 20% to 70% (0.2 to 0.7 progress)
             // Sound & UI checks are 70% to 90% (0.7 to 0.9 progress)
 
+            DisableDayNightCycleForScene();
             progressCallback?.Invoke("Initializing Network Manager...", 0.05f);
             _networkManager = MuGame.Network ?? throw new InvalidOperationException("NetworkManager not initialized in MuGame");
             SubscribeToNetworkEvents();
@@ -99,20 +125,24 @@ namespace Client.Main.Scenes
             UpdateStatusLabel(_networkManager.CurrentState);
 
             progressCallback?.Invoke("Checking Connection State...", 0.80f);
-            if (_networkManager.CurrentState >= ClientConnectionState.ConnectedToConnectServer)
-            {
-                _logger.LogInformation("LoginScene loaded, NetworkManager already connected or connecting. State: {State}", _networkManager.CurrentState);
-                HandleConnectionStateChange(this, _networkManager.CurrentState);
-                if (!_uiInitialized && _networkManager.CurrentState >= ClientConnectionState.ReceivedServerList)
-                {
-                    InitializeServerSelectionUI(); // This will add controls, they'll be initialized by BaseScene's main loop if not already
-                }
-            }
-            else if (_networkManager.CurrentState == ClientConnectionState.Initial ||
-                     _networkManager.CurrentState == ClientConnectionState.Disconnected)
+            if (_networkManager.CurrentState == ClientConnectionState.Initial ||
+                _networkManager.CurrentState == ClientConnectionState.Disconnected)
             {
                 _logger.LogInformation("LoginScene loaded, initiating connection to Connect Server...");
                 _ = _networkManager.ConnectToConnectServerAsync(); // Fire and forget
+            }
+            else if (_networkManager.CurrentState >= ClientConnectionState.ConnectedToConnectServer)
+            {
+                _logger.LogInformation("LoginScene loaded, NetworkManager already connected or connecting. State: {State}", _networkManager.CurrentState);
+
+                if (!_uiInitialized && _networkManager.CurrentState >= ClientConnectionState.ReceivedServerList)
+                {
+                    InitializeServerSelectionUI(); // Ensure UI exists before applying visibility rules
+                }
+
+                HandleConnectionStateChange(this, _networkManager.CurrentState);
+
+                EnsureServerListPopulatedFromCache();
             }
             progressCallback?.Invoke("Login Scene Setup Complete.", 0.90f);
         }
@@ -130,6 +160,7 @@ namespace Client.Main.Scenes
         {
             _logger?.LogDebug("Disposing LoginScene, unsubscribing from network events.");
             UnsubscribeFromNetworkEvents();
+            RestoreDayNightCycle();
             base.Dispose();
         }
 
@@ -235,8 +266,7 @@ namespace Client.Main.Scenes
                         break;
                     case ClientConnectionState.ConnectedToGameServer:
                         showLoginDialog = true;
-                        _loginDialog?.FocusUsername();
-                        _logger.LogDebug("HandleConnectionStateChange: Setting showLoginDialog = true and focusing username.");
+                        _logger.LogDebug("HandleConnectionStateChange: Setting showLoginDialog = true (ConnectedToGameServer).");
                         break;
                     case ClientConnectionState.Authenticating:
                         showLoginDialog = true;
@@ -352,7 +382,39 @@ namespace Client.Main.Scenes
                     InitializeServerSelectionUI();
                 }
                 // Visibility is now handled by HandleConnectionStateChange after state update
+                PopulateServerList(servers);
+                HandleConnectionStateChange(this, _networkManager.CurrentState);
             });
+        }
+
+        private void EnsureServerListPopulatedFromCache()
+        {
+            var cachedServers = _networkManager.GetCachedServerList();
+            if (cachedServers == null || cachedServers.Count == 0)
+            {
+                return;
+            }
+
+            MuGame.ScheduleOnMainThread(() =>
+            {
+                if (!_uiInitialized)
+                {
+                    InitializeServerSelectionUI();
+                }
+
+                PopulateServerList(cachedServers.ToList());
+                HandleConnectionStateChange(this, _networkManager.CurrentState);
+            });
+        }
+
+        private void PopulateServerList(List<ServerInfo> servers)
+        {
+            if (_serverList == null)
+            {
+                return;
+            }
+
+            _serverList.SetServers(servers);
         }
 
         private void HandleCharacterListReceived(object sender,
@@ -513,12 +575,22 @@ namespace Client.Main.Scenes
             // UI visibility will be handled by HandleConnectionStateChange when state changes to RequestingConnectionInfo
             _ = _networkManager.RequestGameServerConnectionAsync(e.Index);
 
-            // On Android the state change might be delayed; show the dialog immediately
+            // Show the dialog immediately and ensure it's on top.
+            // On some Android devices the state change event can be delayed,
+            // leaving the server list visible and drawn above the dialog.
             if (_loginDialog != null)
             {
                 _loginDialog.Visible = true;
+                _loginDialog.BringToFront();
                 _loginDialog.FocusUsername();
             }
+
+            // Proactively hide server selection UI right away to avoid overlap if the
+            // connection state change is delayed (observed on Android builds).
+            _serverList?.GetType(); // no-op to avoid nullable warnings below
+            if (_serverList != null) _serverList.Visible = false;
+            if (_nonEventGroup != null) _nonEventGroup.Visible = false;
+            if (_eventGroup != null) _eventGroup.Visible = false;
         }
 
         // --- Helper Methods ---

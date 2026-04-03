@@ -44,12 +44,15 @@ namespace Client.Main.Controls.UI.Game.Inventory
         {
             if (!Visible || Item == null) return;
 
-            // Position under the cursor, centered
+            // Position under the cursor, centered (use virtual coordinates that match UiScaler.SpriteTransform)
             int widthInPixels = Item.Definition.Width * SquareWidth;
             int heightInPixels = Item.Definition.Height * SquareHeight;
 
-            X = MuGame.Instance.Mouse.X - widthInPixels / 2;
-            Y = MuGame.Instance.Mouse.Y - heightInPixels / 2;
+            // UiMouseState.Position is already in virtual coordinates - use directly
+            var mousePos = MuGame.Instance.UiMouseState.Position;
+
+            X = mousePos.X - widthInPixels / 2;
+            Y = mousePos.Y - heightInPixels / 2;
             ViewSize = new Point(widthInPixels, heightInPixels); // Size for drawing
             ControlSize = ViewSize;
 
@@ -59,7 +62,7 @@ namespace Client.Main.Controls.UI.Game.Inventory
         public override void Draw(GameTime gameTime)
         {
             if (!Visible || Item == null || GraphicsManager.Instance == null) return;
-            
+
             // This method should not be called directly - use Draw(SpriteBatch, GameTime) instead
         }
 
@@ -69,7 +72,7 @@ namespace Client.Main.Controls.UI.Game.Inventory
 
             Rectangle destRect = new Rectangle(X, Y, ViewSize.X, ViewSize.Y);
 
-            // Try to get the item's texture
+            // Try to get the item's texture (avoid generating new BMD previews during drag to prevent flicker)
             Texture2D itemTexture = null;
             if (!string.IsNullOrEmpty(Item.Definition.TexturePath))
             {
@@ -77,14 +80,23 @@ namespace Client.Main.Controls.UI.Game.Inventory
 
                 if (itemTexture == null && Item.Definition.TexturePath.EndsWith(".bmd", StringComparison.OrdinalIgnoreCase))
                 {
-                    try
+                    // Prefer cached previews to avoid render-target switching during the final draw pass.
+                    // Try current drag size first (cached), then common UI sizes (inventory 35px, vault 25px), and scale if needed.
+                    itemTexture = BmdPreviewRenderer.TryGetCachedPreview(Item, ViewSize.X, ViewSize.Y);
+                    if (itemTexture == null)
                     {
-                        itemTexture = BmdPreviewRenderer.GetPreview(Item.Definition, ViewSize.X, ViewSize.Y);
+                        int invW = Item.Definition.Width * InventoryControl.INVENTORY_SQUARE_WIDTH;
+                        int invH = Item.Definition.Height * InventoryControl.INVENTORY_SQUARE_HEIGHT;
+                        itemTexture = BmdPreviewRenderer.TryGetCachedPreview(Item, invW, invH);
                     }
-                    catch (Exception)
+                    if (itemTexture == null)
                     {
-                        // Fall back to rectangle if BMD preview fails
+                        const int VaultCell = 25; // matches VaultControl cell size
+                        int vW = Item.Definition.Width * VaultCell;
+                        int vH = Item.Definition.Height * VaultCell;
+                        itemTexture = BmdPreviewRenderer.TryGetCachedPreview(Item, vW, vH);
                     }
+                    // If still null, skip generating to prevent flicker; fallback rectangle will be drawn this frame.
                 }
             }
 
@@ -100,14 +112,14 @@ namespace Client.Main.Controls.UI.Game.Inventory
                 spriteBatch.Draw(pixel, destRect, Color.DarkGoldenrod * 0.8f);
             }
 
-            // Draw quantity for stackable items (BaseDurability = 0 means it's stackable)
-            if (Item.Definition.BaseDurability == 0 && Item.Durability > 1 && _font != null)
+            // Draw quantity for stackable items (BaseDurability = 0 and MagicDurability = 0 means it's stackable)
+            if (Item.Definition.BaseDurability == 0 && Item.Definition.MagicDurability == 0 && Item.Durability > 1 && _font != null)
             {
                 string quantityText = Item.Durability.ToString();
                 Vector2 textSize = _font.MeasureString(quantityText);
                 float textScale = 0.4f; // Small text
                 Vector2 scaledTextSize = textSize * textScale;
-                
+
                 // Position in upper right corner of the item
                 Vector2 textPosition = new Vector2(
                     destRect.Right - scaledTextSize.X - 2, // 2px margin from right edge

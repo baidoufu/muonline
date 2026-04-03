@@ -30,15 +30,16 @@ namespace Client.Main.Scenes
         public bool IsMouseHandledByUI { get; set; }
         public bool IsMouseInputConsumedThisFrame { get; private set; }
         public bool IsKeyboardEnterConsumedThisFrame { get; private set; }
+        public bool IsKeyboardEscapeConsumedThisFrame { get; private set; }
 
         private ILogger _logger = MuGame.AppLoggerFactory?.CreateLogger<BaseScene>();
 
         public BaseScene()
         {
             AutoViewSize = false;
-            ViewSize = new(MuGame.Instance.Width, MuGame.Instance.Height);
+            ViewSize = new(UiScaler.VirtualSize.X, UiScaler.VirtualSize.Y);
 
-            Controls.Add(DebugPanel = new DebugPanel());
+            Controls.Add(DebugPanel = new DebugPanel { Visible = Constants.SHOW_DEBUG_PANEL });
             Controls.Add(Cursor = new CursorControl());
         }
 
@@ -63,6 +64,8 @@ namespace Client.Main.Scenes
 
             World = newWorld;
             progressCallback?.Invoke($"World {typeof(T).Name} Ready.", 1.0f * (progressCallback == null ? 1.0f : 1.0f));
+
+            DebugPanel.Dispose();
         }
 
         public virtual async Task InitializeWithProgressReporting(Action<string, float> progressCallback)
@@ -127,35 +130,16 @@ namespace Client.Main.Scenes
             var currentMouseControl = MouseControl;
 
             MouseControl = null;
+            MouseHoverObject = null;
             IsMouseInputConsumedThisFrame = false;
             IsKeyboardEnterConsumedThisFrame = false;
+            IsKeyboardEscapeConsumedThisFrame = false;
 
             // Determine MouseHoverControl and MouseControl for the scene
             // Iterate UI controls (children of BaseScene) in reverse order (topmost first)
             GameControl topmostHoverForTooltip = null;
             GameControl topmostInteractiveForScroll = null;
 
-            #if ANDROID
-            // Optimized touch input for Android
-            var touchState = MuGame.Instance.Touch;
-            if (touchState.Count > 0)
-            {
-                var touch = touchState[0];
-                int x = (int)touch.Position.X;
-                int y = (int)touch.Position.Y;
-
-                // Directly update mouse state based on touch
-                if (touch.State == TouchLocationState.Pressed)
-                {
-                    Mouse.SetPosition(x, y);
-                    MuGame.Instance.Mouse = new MouseState(x, y, 0, ButtonState.Pressed, ButtonState.Released, ButtonState.Released, ButtonState.Released, ButtonState.Released);
-                }
-                else if (touch.State == TouchLocationState.Released)
-                {
-                    MuGame.Instance.Mouse = new MouseState(x, y, 0, ButtonState.Released, ButtonState.Released, ButtonState.Released, ButtonState.Released, ButtonState.Released);
-                }
-            }
-#else
             // Simulate mouse click by touch input
             var touchState = MuGame.Instance.Touch;
             if (touchState.Count > 0)
@@ -163,30 +147,21 @@ namespace Client.Main.Scenes
                 var touch = touchState[0];
                 int x = (int)touch.Position.X;
                 int y = (int)touch.Position.Y;
-            
+                bool isTouchDown = touch.State == TouchLocationState.Pressed || touch.State == TouchLocationState.Moved;
+
                 Mouse.SetPosition(x, y);
-            
-                if (touch.State == TouchLocationState.Pressed)
-                {
-                    MuGame.Instance.Mouse = new MouseState(
-                        x, y, 0,
-                        ButtonState.Pressed, ButtonState.Released,
-                        ButtonState.Released, ButtonState.Released, ButtonState.Released
-                    );
-                }
-                else if (touch.State == TouchLocationState.Released)
-                {
-                    MuGame.Instance.Mouse = new MouseState(
-                        x, y, 0,
-                        ButtonState.Released, ButtonState.Released,
-                        ButtonState.Released, ButtonState.Released, ButtonState.Released
-                    );
-                }
+
+                MuGame.Instance.Mouse = new MouseState(
+                    x,
+                    y,
+                    0,
+                    isTouchDown ? ButtonState.Pressed : ButtonState.Released,
+                    ButtonState.Released,
+                    ButtonState.Released,
+                    ButtonState.Released,
+                    ButtonState.Released
+                );
             }
-#endif
-            
-            // set scene's MouseControl (which is the target for scroll)
-            MouseControl = null;
 
             for (int i = Controls.Count - 1; i >= 0; i--)
             {
@@ -220,10 +195,15 @@ namespace Client.Main.Scenes
             }
 
             // Consume scroll for UI before the world processes input
-            int preScrollChange = MuGame.Instance.Mouse.ScrollWheelValue - MuGame.Instance.PrevMouseState.ScrollWheelValue;
+            int preScrollChange = MuGame.Instance.UiMouseState.ScrollWheelValue - MuGame.Instance.PrevUiMouseState.ScrollWheelValue;
             if (preScrollChange != 0 && MouseControl != null && MouseControl.Interactive && MouseControl != World)
             {
                 IsMouseInputConsumedThisFrame = true;
+            }
+
+            if (World is WalkableWorldControl walkableWorld)
+            {
+                walkableWorld.Walker.MouseScroolToZoom = World == MouseHoverControl;
             }
 
             base.Update(gameTime);
@@ -232,13 +212,13 @@ namespace Client.Main.Scenes
                 return;
 
             if (World == null) return;
-            
+
             // Clear MouseHoverObject if no object is currently being hovered
             if (MouseHoverObject != null && !MouseHoverObject.IsMouseHover)
             {
                 MouseHoverObject = null;
             }
-            
+
             // Update cursor after world objects have been updated
             Cursor.Update(gameTime);
 
@@ -252,7 +232,7 @@ namespace Client.Main.Scenes
             // scroll handling - using the MouseControl determined above
             if (MouseControl != null && MouseControl.Interactive) // MouseControl here is the target for scroll
             {
-                int scrollWheelChange = MuGame.Instance.Mouse.ScrollWheelValue - MuGame.Instance.PrevMouseState.ScrollWheelValue;
+                int scrollWheelChange = MuGame.Instance.UiMouseState.ScrollWheelValue - MuGame.Instance.PrevUiMouseState.ScrollWheelValue;
                 if (scrollWheelChange != 0)
                 {
                     int normalizedScrollDelta = scrollWheelChange; // positive for up, negative for down
@@ -265,11 +245,11 @@ namespace Client.Main.Scenes
                     }
                 }
 
-                if (MuGame.Instance.Mouse.LeftButton == ButtonState.Pressed && !MouseControl.IsMousePressed)
+                if (MuGame.Instance.UiMouseState.LeftButton == ButtonState.Pressed && !MouseControl.IsMousePressed)
                 {
                     MouseControl.IsMousePressed = true;
                 }
-                else if (MouseControl == currentMouseControl && MuGame.Instance.Mouse.LeftButton == ButtonState.Released && MouseControl.IsMousePressed)
+                else if (MouseControl == currentMouseControl && MuGame.Instance.UiMouseState.LeftButton == ButtonState.Released && MouseControl.IsMousePressed)
                 {
                     MouseControl.IsMousePressed = false;
                     MouseControl.OnClick();
@@ -288,7 +268,7 @@ namespace Client.Main.Scenes
             // handle 3D world object clicks if UI didn't consume input
             if (!IsMouseInputConsumedThisFrame && MouseHoverObject != null &&
                 MuGame.Instance.PrevMouseState.LeftButton == ButtonState.Pressed &&
-                MuGame.Instance.Mouse.LeftButton == ButtonState.Released)
+                MuGame.Instance.UiMouseState.LeftButton == ButtonState.Released)
             {
                 MouseHoverObject.OnClick();
             }
@@ -316,6 +296,11 @@ namespace Client.Main.Scenes
             IsKeyboardEnterConsumedThisFrame = true;
         }
 
+        public void ConsumeKeyboardEscape()
+        {
+            IsKeyboardEscapeConsumedThisFrame = true;
+        }
+
         public override void Draw(GameTime gameTime)
         {
             if (World == null)
@@ -325,6 +310,28 @@ namespace Client.Main.Scenes
             // This pass populates the depth buffer.
             World.Draw(gameTime);
             World.DrawAfter(gameTime);
+
+#if !ANDROID
+            var worldObjects = World.Objects.GetSnapshot();
+            var droppedItems = World.DroppedItems;
+
+            // --- Pass 2a: Render batched dropped-item shine sprites ---
+            // Drawn as a single SpriteBatch to avoid per-item Begin/End overhead.
+            using (new SpriteBatchScope(
+                       GraphicsManager.Instance.Sprite,
+                       SpriteSortMode.BackToFront,
+                       BlendState.Additive,
+                       GraphicsManager.GetQualityLinearSamplerState(),
+                       DepthStencilState.DepthRead))
+            {
+                for (int i = 0; i < droppedItems.Count; i++)
+                {
+                    var item = droppedItems[i];
+                    if (item == null) continue;
+                    item.DrawShineEffect(gameTime);
+                }
+            }
+#endif
 
             // --- Pass 2: Render 3D-aware UI (Nameplates, 2D BBoxes) ---
             // This batch respects the depth buffer populated by the 3D world.
@@ -336,14 +343,42 @@ namespace Client.Main.Scenes
                        DepthStencilState.DepthRead))     // Read depth buffer but don't write to it
             {
 #if !ANDROID
-                foreach (var worldObject in World.Objects)
+                for (int i = 0; i < worldObjects.Count; i++)
                 {
+                    var worldObject = worldObjects[i];
+                    if (worldObject == null)
+                        continue;
+
                     // Call the public methods to draw depth-aware UI elements
-                    worldObject.DrawHoverName();
                     worldObject.DrawBoundingBox2D();
+
+                    // Dropped items draw their labels in a separate pass (Depth=None) to avoid depth occlusion
+                    // while still batching all labels in one SpriteBatch.
+                    if (worldObject is DroppedItemObject)
+                        continue;
+
+                    worldObject.DrawHoverName();
                 }
 #endif
             }
+
+#if !ANDROID
+            // --- Pass 2b: Render batched dropped-item labels (always visible) ---
+            using (new SpriteBatchScope(
+                       GraphicsManager.Instance.Sprite,
+                       SpriteSortMode.Deferred,
+                       BlendState.NonPremultiplied,
+                       SamplerState.PointClamp,
+                       DepthStencilState.None))
+            {
+                for (int i = 0; i < droppedItems.Count; i++)
+                {
+                    var item = droppedItems[i];
+                    if (item == null) continue;
+                    item.DrawHoverName();
+                }
+            }
+#endif
 
             // --- Pass 3: Render standard 2D UI (HUD overlays) ---
             // This batch ignores the depth buffer and draws on top of everything.
@@ -352,13 +387,21 @@ namespace Client.Main.Scenes
                        SpriteSortMode.Deferred,
                        BlendState.AlphaBlend,
                        SamplerState.PointClamp,
-                       DepthStencilState.None))
+                       DepthStencilState.None,
+                       null,
+                       null,
+                       UiScaler.SpriteTransform))
             {
-                for (int i = 0; i < Controls.Count; i++)
+                var controls = Controls.GetSnapshot();
+                for (int i = 0; i < controls.Count; i++)
                 {
-                    var ctrl = Controls[i];
-                    if (ctrl != World && ctrl.Visible)
-                        ctrl.Draw(gameTime);
+                    var ctrl = controls[i];
+                    if (ctrl == null || ctrl == World || !ctrl.Visible)
+                    {
+                        continue;
+                    }
+
+                    ctrl.Draw(gameTime);
                 }
             }
         }

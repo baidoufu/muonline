@@ -1,4 +1,5 @@
 using Client.Main.Controllers;
+using Client.Main.Helpers;
 using Client.Main.Models;
 using Client.Main.Scenes;
 using Microsoft.Xna.Framework;
@@ -16,6 +17,8 @@ namespace Client.Main.Controls
 {
     public abstract class GameControl : IChildItem<GameControl>, IDisposable
     {
+        public virtual bool NonDisposable => false;
+
         // Fields
         private Point _controlSize, _viewSize;
         private bool _isCurrentlyPressedByMouse = false;
@@ -78,6 +81,9 @@ namespace Client.Main.Controls
         {
             Controls = new ChildrenCollection<GameControl>(this);
         }
+
+        protected virtual MouseState CurrentMouseState => MuGame.Instance.Mouse;
+        protected virtual MouseState PreviousMouseState => MuGame.Instance.PrevMouseState;
 
         // Public Methods
         public virtual bool OnClick()
@@ -153,11 +159,13 @@ namespace Client.Main.Controls
             if (Status != GameControlStatus.Ready || !Visible) return;
 
             // Cache mouse and display rectangle to avoid repeated property lookups
-            var mouse = MuGame.Instance.Mouse;
+            var mouse = CurrentMouseState;
+            var prevMouse = PreviousMouseState;
             Rectangle rect = DisplayRectangle;
+            Point mousePosition = mouse.Position;
             IsMouseOver = Interactive &&
-                          mouse.Position.X >= rect.X && mouse.Position.X <= rect.X + rect.Width &&
-                          mouse.Position.Y >= rect.Y && mouse.Position.Y <= rect.Y + rect.Height;
+                          mousePosition.X >= rect.X && mousePosition.X <= rect.X + rect.Width &&
+                          mousePosition.Y >= rect.Y && mousePosition.Y <= rect.Y + rect.Height;
 
             // moved: Scene.MouseControl = this; 
             // MouseControl is now determined by BaseScene to ensure topmost logic.
@@ -169,7 +177,7 @@ namespace Client.Main.Controls
                     if (mouse.LeftButton == ButtonState.Pressed)
                     {
                         IsMousePressed = true; // for UI styling, indicate it's being pressed
-                        if (MuGame.Instance.PrevMouseState.LeftButton == ButtonState.Released)
+                        if (prevMouse.LeftButton == ButtonState.Released)
                         {
                             _isCurrentlyPressedByMouse = true; // this control initiated the press sequence
                             Scene?.FocusControlIfInteractive(this); // attempt to set focus
@@ -178,7 +186,7 @@ namespace Client.Main.Controls
                     else if (mouse.LeftButton == ButtonState.Released)
                     {
                         // mouse is released WHILE OVER this control
-                        if (_isCurrentlyPressedByMouse && MuGame.Instance.PrevMouseState.LeftButton == ButtonState.Pressed)
+                        if (_isCurrentlyPressedByMouse && prevMouse.LeftButton == ButtonState.Pressed)
                         {
                             // click occurred (press and release over this control)
                             if (OnClick()) // call OnClick and check if it was handled
@@ -304,6 +312,8 @@ namespace Client.Main.Controls
 
         public virtual void Dispose()
         {
+            if (NonDisposable) return;
+
             // Use reverse iteration to avoid ToArray() allocation
             for (int i = Controls.Count - 1; i >= 0; i--)
             {

@@ -1,35 +1,37 @@
-﻿using Client.Main.Controllers;
 using Client.Main.Controls;
-using Client.Main.Controls.UI; // Added for LabelControl
-using Client.Main.Models; // Added for LabelControl
-using Client.Main.Objects;
-using Client.Main.Objects.Player;
+using Client.Main.Controls.UI;
+using Client.Main.Controllers;
+using Client.Main.Graphics;
+using Client.Main.Models;
 using Client.Main.Objects.Worlds.SelectWrold;
-using Client.Main.Scenes;
+using Client.Main.Scenes.SelectCharacter;
 using Microsoft.Extensions.Logging;
 using Microsoft.Xna.Framework;
-using Microsoft.Xna.Framework.Input;
-using MUnique.OpenMU.Network.Packets;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
 using Microsoft.Xna.Framework.Graphics;
+using Microsoft.Xna.Framework.Input;
 
 namespace Client.Main.Worlds
 {
-
     public class SelectWorld : WorldControl
     {
-        private List<PlayerObject> _characterObjects = new List<PlayerObject>();
+        private readonly Vector3 _characterDisplayPosition = new(14000, 12295, 250);
+        private readonly Vector3 _characterDisplayAngle = new(0, 0, MathHelper.ToRadians(90));
         private ILogger<SelectWorld> _logger;
+        private CharacterSelectionController _controller;
 
-        private Dictionary<PlayerObject, LabelControl> _characterLabels = new();
+        public Vector3 CharacterDisplayPosition => _characterDisplayPosition;
+        public Vector3 CharacterDisplayAngle => _characterDisplayAngle;
 
         public SelectWorld() : base(worldIndex: 94)
         {
-            _logger = MuGame.AppLoggerFactory?.CreateLogger<SelectWorld>() ?? throw new InvalidOperationException("LoggerFactory not initialized in MuGame");
+            EnableShadows = false;
+            _logger = MuGame.AppLoggerFactory?.CreateLogger<SelectWorld>() ?? throw new System.InvalidOperationException("LoggerFactory not initialized in MuGame");
             Camera.Instance.ViewFar = 5500f;
+        }
+
+        public void SetController(CharacterSelectionController controller)
+        {
+            _controller = controller;
         }
 
         protected override void CreateMapTileObjects()
@@ -60,108 +62,8 @@ namespace Client.Main.Worlds
             Terrain.DistortionAmplitude = 0.2f;
             Terrain.DistortionFrequency = 1.0f;
 
-            // TODO: Camera position check
             Camera.Instance.Target = new Vector3(14229.295898f, 12340.358398f, 380);
-            Camera.Instance.FOV = 29;
-#if ANDROID
-            Camera.Instance.FOV *= Constants.ANDROID_FOV_SCALE;
-#endif
-        }
-
-        public async Task CreateCharacterObjects(List<(string Name, CharacterClassNumber Class, ushort Level, byte[] Appearance)> characters)
-        {
-            _logger.LogInformation("Creating {Count} character objects…", characters.Count);
-
-            foreach (var old in _characterObjects) { Objects.Remove(old); old.Dispose(); }
-            _characterObjects.Clear();
-
-            foreach (var lbl in _characterLabels.Values)
-            {
-                Scene?.Controls.Remove(lbl);
-                lbl.Dispose();
-            }
-            _characterLabels.Clear();
-
-            // Positions for up to three characters in the select screen.
-            // The first entry should be the center spot so that the
-            // initially selected character appears in the middle.
-            Vector3[] pos =
-            {
-                // Center
-                new Vector3(14000, 12295, 250),
-                // Left
-                new Vector3(14000, 11995, 250),
-                // Right
-                new Vector3(14000, 12595, 250)
-            };
-
-            var loading = new List<Task>();
-
-            for (int i = 0; i < characters.Count && i < pos.Length; i++)
-            {
-                var (name, cls, lvl, appearanceBytes) = characters[i];
-
-                var player = new PlayerObject(new AppearanceData(appearanceBytes))
-                {
-                    Name = name,
-                    CharacterClass = cls,
-                    Position = pos[i],
-                    Angle = new Vector3(0, 0, MathHelper.ToRadians(90)),
-                    Interactive = true,
-                    World = this,
-                    CurrentAction = PlayerAction.PlayerStopMale
-                };
-
-                player.BoundingBoxLocal = new BoundingBox(new Vector3(-40, -40, 0), new Vector3(40, 40, 180));
-
-                player.Click += PlayerObject_Click;
-
-                _characterObjects.Add(player);
-                Objects.Add(player);
-                loading.Add(player.Load());
-
-                var label = new LabelControl
-                {
-                    Text = $"Lv.{lvl}  {name}",
-                    FontSize = 14,
-                    TextColor = Color.White,
-                    HasShadow = true,
-                    ShadowColor = Color.Black * 0.8f,
-                    ShadowOffset = new Vector2(1, 1),
-                    UseManualPosition = true
-                };
-
-                _characterLabels.Add(player, label);
-                Scene?.Controls.Add(label);
-                label.BringToFront();
-            }
-
-            await Task.WhenAll(loading);
-
-            Scene?.Cursor?.BringToFront();
-            Scene?.Controls.OfType<LabelControl>()
-                   .FirstOrDefault(l => l.Text.StartsWith("Select"))?
-                   .BringToFront();
-
-            _logger.LogInformation("Finished creating and loading character objects and labels.");
-        }
-
-        // *** ADD GETTER FOR LABELS (used by Scene) ***
-        public Dictionary<PlayerObject, LabelControl> GetCharacterLabels() => _characterLabels;
-
-
-        private void PlayerObject_Click(object sender, EventArgs e)
-        {
-            if (sender is PlayerObject clickedPlayer && Scene is SelectCharacterScene selectScene)
-            {
-                _logger.LogInformation("PlayerObject '{Name}' clicked.", clickedPlayer.Name);
-                selectScene.CharacterSelected(clickedPlayer.Name);
-            }
-            else if (sender is ModelObject bodyPart && bodyPart.Parent is PlayerObject parentPlayer && Scene is SelectCharacterScene parentScene)
-            {
-                _logger.LogInformation("Body part of '{Name}' clicked.", parentPlayer.Name);
-                parentScene.CharacterSelected(parentPlayer.Name);
-            }
+            Camera.Instance.FOV = 29 * Constants.FOV_SCALE;
         }
 
         public override void Update(GameTime time)
@@ -169,11 +71,12 @@ namespace Client.Main.Worlds
             base.Update(time);
             if (!Visible) return;
 
-            if (Status == GameControlStatus.Ready && _characterLabels.Count > 0)
+            // Update label positions using controller data
+            if (Status == GameControlStatus.Ready && _controller != null)
             {
-                foreach (var (player, label) in _characterLabels)
+                foreach (var (player, label) in _controller.Labels)
                 {
-                    if (player.Status != GameControlStatus.Ready || !player.Visible)
+                    if (player.Status != GameControlStatus.Ready || player.Hidden)
                     {
                         label.Visible = false;
                         continue;
@@ -200,13 +103,16 @@ namespace Client.Main.Worlds
                     float k = label.FontSize / Constants.BASE_FONT_SIZE;
                     Vector2 s = font.MeasureString(label.Text) * k;
 
-                    label.X = (int)(sp.X - s.X / 2f);
-                    label.Y = (int)(sp.Y - s.Y - 4);
+                    var virtualPos = UiScaler.ToVirtual(new Point((int)sp.X, (int)sp.Y));
+
+                    label.X = (int)(virtualPos.X - s.X / 2f);
+                    label.Y = (int)(virtualPos.Y - s.Y - 4);
                     label.ControlSize = new Point((int)s.X, (int)s.Y);
                     label.Visible = true;
                 }
             }
 
+            // Debug key handling
             if (MuGame.Instance.PrevKeyboard.IsKeyDown(Keys.Delete) && MuGame.Instance.Keyboard.IsKeyUp(Keys.Delete))
             {
                 if (Objects.Count > 0)
@@ -233,17 +139,8 @@ namespace Client.Main.Worlds
             gd.BlendState = BlendState.AlphaBlend;
             gd.DepthStencilState = DepthStencilState.Default;
             gd.SamplerStates[0] = SamplerState.LinearClamp;
-            // This prevents state leakage and texture corruption, especially on DirectX
 
             base.Draw(gameTime);
         }
-
-        // Keep existing DrawAfter if needed, otherwise remove if labels are handled by base Draw
-        // public override void DrawAfter(GameTime gameTime)
-        // {
-        //     base.DrawAfter(gameTime);
-        //     // Labels are now part of Controls, so base.DrawAfter handles them if they implement DrawAfter.
-        //     // If LabelControl doesn't override DrawAfter, this method might not be needed here.
-        // }
     }
 }

@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Client.Main.Objects.Effects;
 using Microsoft.Xna.Framework;
 using Microsoft.Extensions.Logging;
+using System;
 
 namespace Client.Main.Objects.NPCS
 {
@@ -15,6 +16,7 @@ namespace Client.Main.Objects.NPCS
     {
         private new readonly ILogger<ElfSoldier> _logger;
         private WingObject _wings;
+
         public ElfSoldier()
         {
             _logger = AppLoggerFactory?.CreateLogger<ElfSoldier>();
@@ -49,7 +51,8 @@ namespace Client.Main.Objects.NPCS
             _wings.Model = await BMDLoader.Instance.Prepare("Item/Wing04.bmd");
 
             await base.Load();
-
+            
+            AnimationSpeed = 25f;
             CurrentAction = (int)PlayerAction.PlayerStopFly;
             Scale = 1.0f;
 
@@ -58,6 +61,20 @@ namespace Client.Main.Objects.NPCS
                 new Vector3(currentBBox.Max.X, currentBBox.Max.Y, currentBBox.Max.Z + 70f));
         }
 
-        protected override void HandleClick() { }
+        protected override void HandleClick()
+        {
+            _logger?.LogInformation("Elf Soldier clicked - sending buff request sequence (NetworkId: {NetworkId})", NetworkId);
+
+            // Send complete buff sequence: TalkToNpc -> BuffRequest
+            var characterService = MuGame.Network?.GetCharacterService();
+            if (characterService != null)
+            {
+                _ = characterService.SendElfSoldierBuffSequenceAsync(NetworkId);
+            }
+            else
+            {
+                _logger?.LogWarning("CharacterService is null - cannot send Elf Soldier buff sequence");
+            }
+        }
     }
 }

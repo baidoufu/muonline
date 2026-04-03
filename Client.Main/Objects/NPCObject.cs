@@ -1,17 +1,46 @@
 using Client.Main.Objects.Player;
 using Client.Main.Objects.Wings;
+using Client.Main.Controls;
 using Microsoft.Extensions.Logging;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using Client.Main.Content;
 using Microsoft.Xna.Framework;
 using Client.Main.Models;
+using System;
+using System.Reflection;
 
 namespace Client.Main.Objects
 {
     public abstract class NPCObject : WalkerObject
     {
         protected new ILogger _logger;
+        private DateTime _lastClickTime = DateTime.MinValue;
+        private const double CLICK_COOLDOWN_SECONDS = 0.5; // Global debounce for all NPCs
+
+        /// <summary>
+        /// Indicates whether this NPC can repair items. Override in derived classes for NPCs that offer repair services.
+        /// </summary>
+        public virtual bool CanRepair => false;
+
+        /// <summary>
+        /// Gets the NPC's display name defined by <see cref="NpcInfoAttribute"/>.
+        /// </summary>
+        public override string DisplayName
+        {
+            get
+            {
+                var attrs = GetType().GetCustomAttributes(typeof(NpcInfoAttribute), inherit: false);
+                foreach (var a in attrs)
+                {
+                    if (a is NpcInfoAttribute attr)
+                    {
+                        return attr.DisplayName;
+                    }
+                }
+                return base.DisplayName;
+            }
+        }
 
         public PlayerMaskHelmObject HelmMask { get; private set; }
         public PlayerHelmObject Helm { get; private set; }
@@ -27,6 +56,7 @@ namespace Client.Main.Objects
         {
             _logger = AppLoggerFactory?.CreateLogger(GetType());
             Interactive = true;
+            AnimationSpeed = 6f;
 
             // Initialize body part objects and link their animations to this parent object
             HelmMask = new PlayerMaskHelmObject { LinkParentAnimation = true, Hidden = true };
@@ -53,7 +83,55 @@ namespace Client.Main.Objects
         public override void OnClick()
         {
             base.OnClick();
+            // Prevent world click-to-move from triggering on NPC clicks
+            MuGame.Instance?.ActiveScene?.SetMouseInputConsumed();
+
+            // Debounce clicks - prevent spam
+            var now = DateTime.UtcNow;
+            var timeSinceLastClick = (now - _lastClickTime).TotalSeconds;
+
+            if (timeSinceLastClick < CLICK_COOLDOWN_SECONDS)
+            {
+                _logger?.LogDebug("NPC click ignored - cooldown active ({TimeRemaining:F2}s remaining)",
+                    CLICK_COOLDOWN_SECONDS - timeSinceLastClick);
+                return;
+            }
+
+            _lastClickTime = now;
+
+            // Track the NPC type for repair mode detection
+            var characterState = MuGame.Network?.GetCharacterState();
+            if (characterState != null)
+            {
+                characterState.LastNpcNetworkId = NetworkId;
+                // Get TypeNumber from NpcInfoAttribute
+                var attr = GetType().GetCustomAttribute<NpcInfoAttribute>();
+                if (attr != null)
+                {
+                    characterState.LastNpcTypeNumber = attr.TypeId;
+                }
+            }
+
+            if (TryQueueInteraction())
+                return;
+
             HandleClick();
+        }
+
+        internal void ExecuteInteraction()
+        {
+            HandleClick();
+        }
+
+        private bool TryQueueInteraction()
+        {
+            if (MuGame.Instance?.ActiveScene?.World is not WalkableWorldControl world)
+                return false;
+
+            if (world.Walker is not PlayerObject player)
+                return false;
+
+            return player.TryQueueNpcInteraction(this);
         }
         protected abstract void HandleClick();
 
@@ -93,35 +171,10 @@ namespace Client.Main.Objects
             }
         }
 
-        protected override void UpdateWorldBoundingBox()
-        {
-            base.UpdateWorldBoundingBox();
-
-            var allCorners = new List<Vector3>(BoundingBoxWorld.GetCorners());
-
-            foreach (var child in Children)
-            {
-                if (child is ModelObject modelChild && modelChild.Visible && modelChild.Model != null)
-                {
-                    allCorners.AddRange(modelChild.BoundingBoxWorld.GetCorners());
-                }
-            }
-
-            if (allCorners.Count > 0)
-            {
-                BoundingBoxWorld = BoundingBox.CreateFromPoints(allCorners);
-            }
-        }
-
         public override void Update(GameTime gameTime)
         {
             bool wasMoving = IsMoving;
             base.Update(gameTime);
-
-            if (Status == GameControlStatus.Ready)
-            {
-                UpdateWorldBoundingBox();
-            }
 
             if (wasMoving && !IsMoving && !IsOneShotPlaying)
             {

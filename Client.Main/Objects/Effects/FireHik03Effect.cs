@@ -1,4 +1,4 @@
-﻿using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 
 namespace Client.Main.Objects.Effects
@@ -18,15 +18,6 @@ namespace Client.Main.Objects.Effects
                 DepthBufferEnable = true,
                 DepthBufferWriteEnable = false
             };
-        }
-
-        public override void Draw(GameTime gameTime)
-        {
-        }
-
-        public override void DrawAfter(GameTime gameTime)
-        {
-            base.Draw(gameTime);
         }
     }
 }

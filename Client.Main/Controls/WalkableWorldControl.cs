@@ -1,9 +1,11 @@
 ﻿using Client.Main.Controllers;
+using Client.Main.Graphics;
 using Client.Main.Models;
 using Client.Main.Objects;
 using Client.Main.Objects.Monsters;
 using Client.Main.Objects.Player;
 using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
 using System;
 using System.Threading.Tasks;
@@ -21,6 +23,10 @@ namespace Client.Main.Controls
         private float _cursorNextMoveTime;
         private int _previousScrollValue;
         private float _targetCameraDistance;
+
+        // --- Mouse tile caching for performance ---
+        private Vector2 _lastMouseInBackBuffer = new Vector2(-1, -1);
+        private Vector3 _lastCameraPosition;
 
         // --- Properties ---
 
@@ -43,6 +49,8 @@ namespace Client.Main.Controls
         /// Height offset applied when placing the cursor above terrain.
         /// </summary>
         public float ExtraHeight { get; set; }
+
+        public int HeroTile { get; private set; }
 
         // --- Constructors ---
 
@@ -77,6 +85,8 @@ namespace Client.Main.Controls
             if (Status != GameControlStatus.Ready || !Visible)
                 return;
 
+            HeroTile = World.Terrain.GetHeroTile(Walker.Position.X, Walker.Position.Y);
+
             // some UI overlay has the mouse, skip click-to-move this frame.
             if (Scene != null && Scene.MouseHoverControl != null && Scene.MouseHoverControl != Scene.World)
             {
@@ -97,6 +107,14 @@ namespace Client.Main.Controls
                 MuGame.Instance.Mouse.LeftButton == ButtonState.Pressed &&
                 _cursorNextMoveTime <= 0f)
             {
+                // If an NPC is under the cursor, consume click and don't trigger move
+                if (Scene.MouseHoverObject is NPCObject)
+                {
+                    if (Scene is Client.Main.Scenes.BaseScene bs)
+                        bs.SetMouseInputConsumed();
+                    _cursorNextMoveTime = 250f;
+                    return;
+                }
                 if (Walker is PlayerObject player)
                 {
                     MonsterObject monster = hoveredMonster ?? FindMonsterAtTile(MouseTileX, MouseTileY);
@@ -155,24 +173,53 @@ namespace Client.Main.Controls
 
         /// <summary>
         /// Calculates which terrain tile is under the mouse cursor by raycasting.
+        /// Uses caching when mouse is idle (not holding button) to save CPU.
         /// </summary>
         private void CalculateMouseTilePos()
         {
-            var mousePos = Mouse.GetState().Position.ToVector2();
-            var viewport = GraphicsManager.Instance.GraphicsDevice.Viewport;
+            // Use mouse position in back buffer space (handles fullscreen borderless scaling)
+            var currentMousePos = MuGame.Instance.MouseInBackBuffer;
+            var currentCamPos = Camera.Instance.Position;
+            bool isButtonHeld = MuGame.Instance.Mouse.LeftButton == ButtonState.Pressed;
 
-            var near = viewport.Unproject(new Vector3(mousePos, 0f),
-                                          Camera.Instance.Projection,
-                                          Camera.Instance.View,
+            // Use cache only when mouse button is NOT held and position hasn't changed
+            // When button is held, always recalculate to support continuous movement
+            if (!isButtonHeld &&
+                currentMousePos == _lastMouseInBackBuffer &&
+                currentCamPos == _lastCameraPosition)
+            {
+                return; // Use cached MouseTileX/MouseTileY values
+            }
+
+            _lastMouseInBackBuffer = currentMousePos;
+            _lastCameraPosition = currentCamPos;
+
+            // Create viewport from actual back buffer size (not GraphicsDevice.Viewport which may be stale
+            // from render target usage during previous Draw() call)
+            var gd = GraphicsManager.Instance.GraphicsDevice;
+            var viewport = new Viewport(0, 0,
+                gd.PresentationParameters.BackBufferWidth,
+                gd.PresentationParameters.BackBufferHeight);
+
+            var cam = Camera.Instance;
+            var proj = cam.Projection;
+            var view = cam.View;
+
+            var near = viewport.Unproject(new Vector3(currentMousePos, 0f),
+                                          proj,
+                                          view,
                                           Matrix.Identity);
-            var far = viewport.Unproject(new Vector3(mousePos, 1f),
-                                          Camera.Instance.Projection,
-                                          Camera.Instance.View,
+            var far = viewport.Unproject(new Vector3(currentMousePos, 1f),
+                                          proj,
+                                          view,
                                           Matrix.Identity);
 
             var ray = new Ray(near, Vector3.Normalize(far - near));
-            const float maxDistance = 10000f;
-            float step = Constants.TERRAIN_SCALE / 10f;
+
+            // Optimized ray march: coarse step first, then refine on hit
+            const float maxDistance = 5000f;
+            float coarseStep = Constants.TERRAIN_SCALE; // 100f - faster scanning
+            float fineStep = Constants.TERRAIN_SCALE / 10f; // 10f - precise hit detection
             float traveled = 0f;
 
             var lastPos = ray.Position;
@@ -182,17 +229,40 @@ namespace Client.Main.Controls
 
             while (traveled < maxDistance)
             {
-                traveled += step;
+                traveled += coarseStep;
                 var pos = ray.Position + ray.Direction * traveled;
                 float terrainZ = Terrain.RequestTerrainHeight(pos.X, pos.Y) + ExtraHeight;
                 float diff = pos.Z - terrainZ;
 
                 if (lastDiff > 0f && diff <= 0f)
                 {
-                    float t = lastDiff / (lastDiff - diff);
-                    hitPos = Vector3.Lerp(lastPos, pos, t);
-                    hit = true;
-                    break;
+                    // Found crossing - refine within this segment
+                    float segmentStart = traveled - coarseStep;
+                    float refineTraveled = segmentStart;
+                    var refineLastPos = ray.Position + ray.Direction * segmentStart;
+                    float refineLastDiff = refineLastPos.Z - Terrain.RequestTerrainHeight(refineLastPos.X, refineLastPos.Y) + ExtraHeight;
+
+                    while (refineTraveled < traveled)
+                    {
+                        refineTraveled += fineStep;
+                        var refinePos = ray.Position + ray.Direction * refineTraveled;
+                        float refineTerrainZ = Terrain.RequestTerrainHeight(refinePos.X, refinePos.Y) + ExtraHeight;
+                        float refineDiff = refinePos.Z - refineTerrainZ;
+
+                        if (refineLastDiff > 0f && refineDiff <= 0f)
+                        {
+                            float t = refineLastDiff / (refineLastDiff - refineDiff);
+                            hitPos = Vector3.Lerp(refineLastPos, refinePos, t);
+                            hit = true;
+                            break;
+                        }
+
+                        refineLastPos = refinePos;
+                        refineLastDiff = refineDiff;
+                    }
+
+                    if (hit)
+                        break;
                 }
 
                 lastPos = pos;
@@ -219,9 +289,11 @@ namespace Client.Main.Controls
         /// </summary>
         private MonsterObject FindMonsterAtTile(byte tileX, byte tileY)
         {
-            foreach (var obj in Objects)          // Objects list comes from WorldControl
+            var monsters = Monsters;
+            for (int i = 0; i < monsters.Count; i++)
             {
-                if (obj is MonsterObject m &&
+                var m = monsters[i];
+                if (m != null &&
                     m.Location.X == tileX &&
                     m.Location.Y == tileY)
                 {

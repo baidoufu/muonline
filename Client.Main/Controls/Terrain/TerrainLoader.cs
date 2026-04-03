@@ -9,7 +9,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using static Client.Main.Utils;
+using static Client.Main.Core.Utilities.Utils;
 
 namespace Client.Main.Controls.Terrain
 {
@@ -20,6 +20,7 @@ namespace Client.Main.Controls.Terrain
     {
         private readonly short _worldIndex;
         private readonly TerrainData _terrainData;
+        private bool _replaceTextureMapping;
 
         public TerrainLoader(short worldIndex)
         {
@@ -27,9 +28,22 @@ namespace Client.Main.Controls.Terrain
             _terrainData = new TerrainData();
         }
 
-        public void SetTextureMapping(Dictionary<int, string> textureMapping)
+        public void SetTextureMapping(Dictionary<int, string> textureMapping, bool replaceDefaults)
         {
-            _terrainData.TextureMappingFiles = new Dictionary<int, string>(textureMapping);
+            _replaceTextureMapping = replaceDefaults;
+            if (textureMapping == null)
+                return;
+
+            if (replaceDefaults)
+            {
+                _terrainData.TextureMappingFiles.Clear();
+            }
+
+            // Apply overrides (or replace defaults when requested)
+            foreach (var kvp in textureMapping)
+            {
+                _terrainData.TextureMappingFiles[kvp.Key] = kvp.Value;
+            }
         }
 
         public async Task<TerrainData> LoadAsync()
@@ -67,10 +81,13 @@ namespace Client.Main.Controls.Terrain
             {
                 textureMapFiles[kvp.Key] = GetActualPath(Path.Combine(fullPathWorldFolder, kvp.Value));
             }
-            for (int i = 1; i <= 16; i++)
+            if (!_replaceTextureMapping)
             {
-                var extTilePath = GetActualPath(Path.Combine(fullPathWorldFolder, $"ExtTile{i:00}.ozj"));
-                textureMapFiles[13 + i] = extTilePath;
+                for (int i = 1; i <= 16; i++)
+                {
+                    var extTilePath = GetActualPath(Path.Combine(fullPathWorldFolder, $"ExtTile{i:00}.ozj"));
+                    textureMapFiles[13 + i] = extTilePath;
+                }
             }
 
             _terrainData.Textures = new Microsoft.Xna.Framework.Graphics.Texture2D[textureMapFiles.Length];

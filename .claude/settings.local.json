@@ -5,7 +5,18 @@
       "Bash(dotnet mgcb:*)",
       "Bash(cp:*)",
       "Bash(dotnet build:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(dotnet clean:*)",
+      "WebSearch",
+      "Bash(dotnet restore:*)",
+      "Bash(dotnet msbuild:*)",
+      "Bash(logfile=build.log)",
+      "Bash(dotnet list:*)",
+      "Bash(mv:*)",
+      "Bash(dotnet nuget:*)",
+      "Bash(dotnet run)",
+      "Bash(cat:*)",
+      "Bash(dotnet:*)"
     ],
     "deny": []
   }

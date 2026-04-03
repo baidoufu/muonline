@@ -18,6 +18,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
 using System.Text;
+using System.Net.NetworkInformation;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -29,6 +30,8 @@ namespace Client.Main.Networking
         private static readonly SimpleModulusKeys EncryptKeys = PipelinedSimpleModulusEncryptor.DefaultClientKey;
         private static readonly SimpleModulusKeys DecryptKeys = PipelinedSimpleModulusDecryptor.DefaultClientKey;
         private static readonly byte[] Xor3Keys = DefaultKeys.Xor3Keys;
+        private const int ClientVersionLength = 5;
+        private const int ClientSerialLength = 16;
 
         private readonly ILoggerFactory _loggerFactory;
         private readonly ILogger<NetworkManager> _logger;
@@ -43,9 +46,11 @@ namespace Client.Main.Networking
         private readonly ScopeManager _scopeManager;
         private readonly Dictionary<byte, byte> _serverDirectionMap;
         private string _selectedCharacterNameForLogin = string.Empty;
+        private readonly Ping _pingSender = new Ping();
 
         private ClientConnectionState _currentState = ClientConnectionState.Initial;
         private List<ServerInfo> _serverList = new();
+        private List<(string Name, CharacterClassNumber Class, ushort Level, byte[] Appearance)> _lastCharacterList;
         private CancellationTokenSource _managerCts;
 
         private string _currentHost = string.Empty; // Host of current connection
@@ -59,6 +64,7 @@ namespace Client.Main.Networking
         public event EventHandler LoginSuccess;
         public event EventHandler EnteredGame;
         public event EventHandler<LoginResponse.LoginResult> LoginFailed;
+        public event EventHandler<LogOutType> LogoutResponseReceived;
 
         // Properties
         public ClientConnectionState CurrentState => _currentState;
@@ -73,6 +79,8 @@ namespace Client.Main.Networking
         public TargetProtocolVersion TargetVersion => _packetRouter.TargetVersion;
         public string CurrentHost => _currentHost;
         public int CurrentPort => _currentPort;
+        public IReadOnlyList<(string Name, CharacterClassNumber Class, ushort Level, byte[] Appearance)> GetCachedCharacterList()
+            => _lastCharacterList is null ? Array.Empty<(string, CharacterClassNumber, ushort, byte[])>() : new List<(string, CharacterClassNumber, ushort, byte[])>(_lastCharacterList);
 
         // Constructors
         public NetworkManager(ILoggerFactory loggerFactory, MuOnlineSettings settings, CharacterState characterState, ScopeManager scopeManager)
@@ -84,8 +92,8 @@ namespace Client.Main.Networking
             _scopeManager = scopeManager;
             _partyManager = new PartyManager(_loggerFactory);
 
-            var clientVersionBytes = Encoding.ASCII.GetBytes(settings.ClientVersion);
-            var clientSerialBytes = Encoding.ASCII.GetBytes(settings.ClientSerial);
+            var clientVersionBytes = BuildClientVersionBytes(settings.ClientVersion, _logger);
+            var clientSerialBytes = BuildClientSerialBytes(settings.ClientSerial, _logger);
             var targetVersion = System.Enum.Parse<TargetProtocolVersion>(settings.ProtocolVersion, ignoreCase: true);
 
             _connectionManager = new ConnectionManager(loggerFactory, EncryptKeys, DecryptKeys);
@@ -238,6 +246,47 @@ namespace Client.Main.Networking
             }
         }
 
+        /// <summary>
+        /// Disconnects any existing Connect Server connection and reconnects using the current settings.
+        /// Useful when host/port are changed at runtime (e.g., from UI).
+        /// </summary>
+        public async Task ForceReconnectToConnectServerAsync()
+        {
+            _logger.LogInformation("Force reconnecting to Connect Server {Host}:{Port}", _settings.ConnectServerHost, _settings.ConnectServerPort);
+
+            try
+            {
+                await _connectionManager.DisconnectAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error disconnecting before reconnect.");
+            }
+
+            _serverList.Clear();
+            _currentHost = string.Empty;
+            _currentPort = 0;
+            UpdateState(ClientConnectionState.Disconnected);
+
+            await ConnectToConnectServerAsync();
+        }
+
+        /// <summary>
+        /// Updates the connect server host/port used for subsequent connections.
+        /// </summary>
+        public void UpdateConnectServerSettings(string host, int port)
+        {
+            if (string.IsNullOrWhiteSpace(host) || port <= 0 || port > 65535)
+            {
+                _logger.LogWarning("Ignoring invalid connect server settings: {Host}:{Port}", host, port);
+                return;
+            }
+
+            _logger.LogInformation("Applying connect server settings: {Host}:{Port}", host, port);
+            _settings.ConnectServerHost = host;
+            _settings.ConnectServerPort = port;
+        }
+
         public async Task RequestServerListAsync()
         {
             if (_currentState != ClientConnectionState.ConnectedToConnectServer && _currentState != ClientConnectionState.ReceivedServerList)
@@ -342,6 +391,12 @@ namespace Client.Main.Networking
                 try
                 {
                     var game = MuGame.Instance;
+                    // Avoid racing with SelectCharacterScene which will switch to GameScene
+                    if (game?.ActiveScene is SelectCharacterScene)
+                    {
+                        _logger.LogInformation("ProcessCharacterRespawn: Currently in SelectCharacterScene; deferring scene change to it.");
+                        return;
+                    }
                     if (game?.ActiveScene is not GameScene gs)
                     {
                         _logger.LogWarning("ProcessCharacterRespawn: ActiveScene is not GameScene. Changing scene.");
@@ -350,7 +405,7 @@ namespace Client.Main.Networking
                     }
 
                     var currentWorld = gs.World as WalkableWorldControl;
-                    bool mapChanged = currentWorld == null || currentWorld.WorldIndex != mapId + 1;
+                    bool mapChanged = currentWorld == null || currentWorld.MapId != mapId;
 
                     _logger.LogDebug("ProcessCharacterRespawn: CurrentWorldIndex: {CurrentIdx}, NewMapId: {NewMapId}, MapChanged: {MapChangedFlag}",
                         currentWorld?.WorldIndex, mapId, mapChanged);
@@ -359,6 +414,9 @@ namespace Client.Main.Networking
                     hero.Reset();
                     hero.Location = new Vector2(x, y);
                     hero.Direction = (Client.Main.Models.Direction)direction;
+                    // Synchronize MoveTargetPosition to prevent walk animation after teleport
+                    hero.MoveTargetPosition = hero.TargetPosition;
+                    hero.Position = hero.TargetPosition;
 
                     if (mapChanged)
                     {
@@ -376,9 +434,6 @@ namespace Client.Main.Networking
                     else
                     {
                         _logger.LogInformation("ProcessCharacterRespawn: Same map ({MapId}). Updating hero position.", mapId);
-                        hero.MoveTargetPosition = hero.TargetPosition;
-                        hero.Position = hero.TargetPosition;
-
                         _logger.LogInformation("ProcessCharacterRespawn: Sending ClientReadyAfterMapChange for same map teleport/respawn.");
                         await _characterService.SendClientReadyAfterMapChangeAsync();
                     }
@@ -429,7 +484,16 @@ namespace Client.Main.Networking
         }
 
         internal void ProcessCharacterList(List<(string Name, CharacterClassNumber Class, ushort Level, byte[] Appearance)> characters)
-        {
+        {            // If we receive a character list while in-game (e.g., returning to character selection),
+            // normalize the state back to ConnectedToGameServer so UI can select a character without rejection.
+            if (_currentState == ClientConnectionState.InGame)
+            {
+                _logger.LogInformation("ProcessCharacterList: Current state is InGame; switching to ConnectedToGameServer for character selection.");
+                UpdateState(ClientConnectionState.ConnectedToGameServer);
+            }
+            // Cache the last received list for potential fallback usage
+            try { _lastCharacterList = characters?.Select(c => (c.Name, c.Class, c.Level, c.Appearance?.ToArray() ?? Array.Empty<byte>())).ToList() ?? new(); }
+            catch { _lastCharacterList = characters ?? new(); }
             _logger.LogInformation(">>> ProcessCharacterList: Received list with {Count} characters. Raising event on UI thread...", characters?.Count ?? 0);
             MuGame.ScheduleOnMainThread(() =>
             {
@@ -543,6 +607,58 @@ namespace Client.Main.Networking
             }
         }
 
+        internal async Task ProcessLogoutResponseAsync(LogOutType type)
+        {
+            _logger.LogInformation(">>> ProcessLogoutResponse: Received logout response type {Type}", type);
+            _characterState.IsInGame = false;
+
+            switch (type)
+            {
+                case LogOutType.BackToCharacterSelection:
+                    UpdateState(ClientConnectionState.ConnectedToGameServer);
+                    try
+                    {
+                        await _characterService.RequestCharacterListAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error requesting character list after logout response.");
+                    }
+                    break;
+
+                case LogOutType.BackToServerSelection:
+                    try
+                    {
+                        await _connectionManager.DisconnectAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error while disconnecting from game server during logout to server selection.");
+                    }
+
+                    UpdateState(ClientConnectionState.Disconnected);
+                    break;
+
+                case LogOutType.CloseGame:
+                    _logger.LogInformation("Logout type CloseGame received. No additional action taken by client.");
+                    break;
+            }
+
+            MuGame.ScheduleOnMainThread(() =>
+            {
+                try
+                {
+                    LogoutResponseReceived?.Invoke(this, type);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error notifying LogoutResponseReceived subscribers.");
+                }
+            });
+
+            _logger.LogInformation("<<< ProcessLogoutResponse: Handled logout response type {Type}", type);
+        }
+
         internal void ProcessCharacterInformation()
         {
             if (_currentState != ClientConnectionState.SelectingCharacter)
@@ -569,6 +685,10 @@ namespace Client.Main.Networking
                 EnteredGame?.Invoke(this, EventArgs.Empty);
             }
             catch (Exception ex) { _logger.LogError(ex, "--- ProcessCharacterInformation: Exception during EnteredGame event invocation."); }
+
+            // Legacy quest state list (A0) - required for classic class-change quest UI (Sebina/Marlon/Devin).
+            _ = _characterService.RequestLegacyQuestStateListAsync();
+
             _logger.LogInformation("<<< ProcessCharacterInformation: State updated and EnteredGame event raised.");
         }
 
@@ -584,8 +704,7 @@ namespace Client.Main.Networking
 
             try
             {
-                using var p = new System.Net.NetworkInformation.Ping();
-                var reply = await p.SendPingAsync(_currentHost, timeoutMs);
+                var reply = await _pingSender.SendPingAsync(_currentHost, timeoutMs);
                 return reply.Status == System.Net.NetworkInformation.IPStatus.Success
                     ? (int?)reply.RoundtripTime
                     : null;
@@ -611,11 +730,279 @@ namespace Client.Main.Networking
             return new ValueTask(_packetRouter.OnDisconnected());
         }
 
+        private static byte[] BuildClientVersionBytes(string clientVersion, ILogger logger)
+        {
+            if (string.IsNullOrWhiteSpace(clientVersion))
+            {
+                logger.LogWarning("ClientVersion is empty; defaulting to 00000 for protocol handshake.");
+                return new byte[ClientVersionLength];
+            }
+
+            string trimmed = clientVersion.Trim();
+
+            if (IsFiveDigitVersion(trimmed))
+            {
+                return Encoding.ASCII.GetBytes(trimmed);
+            }
+
+            if (TryNormalizeClientVersion(trimmed, out string normalized))
+            {
+                logger.LogInformation("Normalized ClientVersion '{Input}' -> '{Normalized}'.", trimmed, normalized);
+                return Encoding.ASCII.GetBytes(normalized);
+            }
+
+            logger.LogWarning("ClientVersion '{Input}' not recognized; using padded ASCII bytes.", trimmed);
+            return ToFixedLengthAsciiBytes(trimmed, ClientVersionLength);
+        }
+
+        private static byte[] BuildClientSerialBytes(string clientSerial, ILogger logger)
+        {
+            if (string.IsNullOrWhiteSpace(clientSerial))
+            {
+                logger.LogWarning("ClientSerial is empty; defaulting to zeros for protocol handshake.");
+                return new byte[ClientSerialLength];
+            }
+
+            string trimmed = clientSerial.Trim();
+            var bytes = Encoding.ASCII.GetBytes(trimmed);
+            if (bytes.Length == ClientSerialLength)
+            {
+                return bytes;
+            }
+
+            if (bytes.Length > ClientSerialLength)
+            {
+                logger.LogWarning("ClientSerial '{Input}' exceeds {Length} bytes; truncating.", trimmed, ClientSerialLength);
+                var truncated = new byte[ClientSerialLength];
+                Array.Copy(bytes, truncated, ClientSerialLength);
+                return truncated;
+            }
+
+            logger.LogWarning("ClientSerial '{Input}' shorter than {Length} bytes; padding with zeros.", trimmed, ClientSerialLength);
+            var padded = new byte[ClientSerialLength];
+            Array.Copy(bytes, padded, bytes.Length);
+            return padded;
+        }
+
+        private static bool IsFiveDigitVersion(string value)
+        {
+            if (value.Length != ClientVersionLength)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < value.Length; i++)
+            {
+                char ch = value[i];
+                if (ch < '0' || ch > '9')
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool TryNormalizeClientVersion(string input, out string normalized)
+        {
+            normalized = null;
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                return false;
+            }
+
+            string trimmed = input.Trim();
+            if (IsFiveDigitVersion(trimmed))
+            {
+                normalized = trimmed;
+                return true;
+            }
+
+            string[] parts = trimmed.Split('.', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 2)
+            {
+                if (!TryParseSingleDigit(parts[0], out int major))
+                {
+                    return false;
+                }
+
+                int minor;
+                int patch;
+                if (parts.Length == 2)
+                {
+                    if (!TryParseMinorAndPatch(parts[1], out minor, out patch))
+                    {
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!TryParseTwoDigitNumber(parts[1], out minor))
+                    {
+                        return false;
+                    }
+
+                    if (!TryParsePatchToken(parts[2], out patch))
+                    {
+                        return false;
+                    }
+                }
+
+                normalized = $"{major}{minor:00}{patch:00}";
+                return normalized.Length == ClientVersionLength;
+            }
+
+            return false;
+        }
+
+        private static bool TryParseSingleDigit(string token, out int value)
+        {
+            value = 0;
+            foreach (char ch in token)
+            {
+                if (char.IsDigit(ch))
+                {
+                    value = ch - '0';
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryParseTwoDigitNumber(string token, out int value)
+        {
+            value = 0;
+            int digits = 0;
+            foreach (char ch in token)
+            {
+                if (!char.IsDigit(ch))
+                {
+                    break;
+                }
+
+                value = (value * 10) + (ch - '0');
+                digits++;
+                if (digits == 2)
+                {
+                    break;
+                }
+            }
+
+            return digits > 0;
+        }
+
+        private static bool TryParseMinorAndPatch(string token, out int minor, out int patch)
+        {
+            minor = 0;
+            patch = 0;
+            int digitCount = 0;
+            int patchDigits = 0;
+            int patchDigitCount = 0;
+            char letter = '\0';
+
+            foreach (char ch in token)
+            {
+                if (char.IsDigit(ch))
+                {
+                    if (digitCount < 2)
+                    {
+                        minor = (minor * 10) + (ch - '0');
+                    }
+                    else if (patchDigitCount < 2)
+                    {
+                        patchDigits = (patchDigits * 10) + (ch - '0');
+                        patchDigitCount++;
+                    }
+
+                    digitCount++;
+                }
+                else if (letter == '\0' && char.IsLetter(ch))
+                {
+                    letter = ch;
+                }
+            }
+
+            if (digitCount == 0)
+            {
+                return false;
+            }
+
+            if (letter != '\0')
+            {
+                patch = LetterToNumber(letter);
+                return patch > 0;
+            }
+
+            if (patchDigitCount > 0)
+            {
+                patch = patchDigits;
+                return true;
+            }
+
+            patch = 0;
+            return true;
+        }
+
+        private static bool TryParsePatchToken(string token, out int patch)
+        {
+            patch = 0;
+            int digits = 0;
+            foreach (char ch in token)
+            {
+                if (char.IsDigit(ch))
+                {
+                    if (digits < 2)
+                    {
+                        patch = (patch * 10) + (ch - '0');
+                        digits++;
+                    }
+                }
+                else if (char.IsLetter(ch))
+                {
+                    patch = LetterToNumber(ch);
+                    return patch > 0;
+                }
+            }
+
+            return digits > 0;
+        }
+
+        private static int LetterToNumber(char letter)
+        {
+            if (!char.IsLetter(letter))
+            {
+                return 0;
+            }
+
+            char lower = char.ToLowerInvariant(letter);
+            if (lower < 'a' || lower > 'z')
+            {
+                return 0;
+            }
+
+            return lower - 'a' + 1;
+        }
+
+        private static byte[] ToFixedLengthAsciiBytes(string value, int length)
+        {
+            var bytes = Encoding.ASCII.GetBytes(value ?? string.Empty);
+            if (bytes.Length == length)
+            {
+                return bytes;
+            }
+
+            var result = new byte[length];
+            Array.Copy(bytes, result, Math.Min(bytes.Length, length));
+            return result;
+        }
+
         // IAsyncDisposable Implementation
         public async ValueTask DisposeAsync()
         {
             _logger.LogInformation("Disposing NetworkManager...");
             _managerCts.Cancel();
+            _pingSender.Dispose();
             await _connectionManager.DisposeAsync();
             _managerCts.Dispose();
             _logger.LogInformation("NetworkManager disposed.");

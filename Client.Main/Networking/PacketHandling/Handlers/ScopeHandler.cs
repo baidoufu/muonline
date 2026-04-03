@@ -3,8 +3,8 @@ using MUnique.OpenMU.Network.Packets.ServerToClient;
 using Client.Main.Core.Utilities;
 using Client.Main.Core.Models;
 using System;
+using System.Collections.Concurrent;
 using System.Threading.Tasks;
-using System.Linq;
 using MUnique.OpenMU.Network.Packets;
 using Client.Main.Controls;
 using Microsoft.Xna.Framework;
@@ -14,8 +14,10 @@ using Client.Main.Objects;
 using Client.Main.Objects.Player;
 using Client.Main.Objects.Effects;
 using Client.Main.Core.Client;
+using Client.Main.Configuration;
 using Client.Main.Scenes;
 using Client.Main.Controllers;
+using System.Threading;
 using Client.Data.ATT;
 
 namespace Client.Main.Networking.PacketHandling.Handlers
@@ -25,6 +27,12 @@ namespace Client.Main.Networking.PacketHandling.Handlers
     /// </summary>
     public class ScopeHandler : IGamePacketHandler
     {
+        private static readonly string[] _recentHitPackets = new string[12];
+        private static int _recentHitPacketIndex = -1;
+
+        internal static string[] RecentHitPackets => _recentHitPackets;
+        internal static int RecentHitPacketIndex => System.Threading.Volatile.Read(ref _recentHitPacketIndex);
+
         // ─────────────────────────── Fields ───────────────────────────
         private readonly ILogger<ScopeHandler> _logger;
         private readonly ScopeManager _scopeManager;
@@ -33,9 +41,16 @@ namespace Client.Main.Networking.PacketHandling.Handlers
         private readonly PartyManager _partyManager;
         private readonly TargetProtocolVersion _targetVersion;
         private readonly ILoggerFactory _loggerFactory;
+        private readonly bool _useExtendedWalkFormat;
+        private readonly Dictionary<byte, byte> _serverToClientDirMap;
 
         private static readonly List<NpcScopeObject> _pendingNpcsMonsters = new List<NpcScopeObject>();
         private static readonly List<PlayerScopeObject> _pendingPlayers = new List<PlayerScopeObject>();
+        private static readonly ConcurrentQueue<NpcSpawnRequest> _npcSpawnQueue = new();
+        private static int _npcSpawnsInFlight;
+        private const int MaxNpcSpawnsPerFrame = 8;
+        private const int MaxConcurrentNpcSpawns = 8;
+        private static ScopeHandler _activeInstance;
 
         // ─────────────────────── Constructors ────────────────────────
         public ScopeHandler(
@@ -44,7 +59,8 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             CharacterState characterState,
             NetworkManager networkManager,
             PartyManager partyManager,
-            TargetProtocolVersion targetVersion)
+            TargetProtocolVersion targetVersion,
+            MuOnlineSettings settings)
         {
             _logger = loggerFactory.CreateLogger<ScopeHandler>();
             _scopeManager = scopeManager;
@@ -53,6 +69,73 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             _partyManager = partyManager;
             _targetVersion = targetVersion;
             _loggerFactory = loggerFactory;
+            _activeInstance = this;
+
+            // Determine if server sends ObjectWalkedExtended based on client version.
+            // OpenMU uses [MinimumClient(106, 3)] for Extended format (version >= 1.06.3).
+            _useExtendedWalkFormat = targetVersion >= TargetProtocolVersion.Season6
+                                    && ParseClientVersionMajorMinor(settings.ClientVersion) >= 107;
+
+            // Build server→client direction map (inverse of the client→server DirectionMap).
+            _serverToClientDirMap = new Dictionary<byte, byte>();
+            var clientToServer = networkManager.GetDirectionMap();
+            if (clientToServer != null)
+            {
+                foreach (var kvp in clientToServer)
+                {
+                    _serverToClientDirMap[kvp.Value] = kvp.Key;
+                }
+            }
+
+            _logger.LogInformation("ScopeHandler: UseExtendedWalkFormat={Extended}, ServerToClientDirMap entries={Count}",
+                _useExtendedWalkFormat, _serverToClientDirMap.Count);
+        }
+
+        /// <summary>
+        /// Parses "X.YYz" client version string to major*100+minor (e.g. "2.04d" → 204, "1.04d" → 104).
+        /// </summary>
+        private static int ParseClientVersionMajorMinor(string clientVersion)
+        {
+            if (string.IsNullOrEmpty(clientVersion) || clientVersion.Length < 4)
+                return 0;
+
+            // Format: "X.YYz" where X=season, YY=episode, z=patch letter
+            if (int.TryParse(clientVersion.AsSpan(0, 1), out int season)
+                && int.TryParse(clientVersion.AsSpan(2, 2), out int episode))
+            {
+                return season * 100 + episode;
+            }
+
+            return 0;
+        }
+
+        /// <summary>
+        /// Maps a server direction byte (0-7) to the client Direction enum using the inverse direction map.
+        /// </summary>
+        private Client.Main.Models.Direction MapServerDirection(byte serverDirection)
+        {
+            if (serverDirection > 7)
+                return Client.Main.Models.Direction.South;
+
+            if (_serverToClientDirMap.TryGetValue(serverDirection, out byte clientDir))
+                return (Client.Main.Models.Direction)clientDir;
+
+            return (Client.Main.Models.Direction)serverDirection;
+        }
+
+        private static void RecordHitPacket(ReadOnlySpan<byte> packetSpan)
+        {
+            try
+            {
+                var hex = BitConverter.ToString(packetSpan.ToArray()).Replace("-", " ");
+                var entry = $"Len={packetSpan.Length} Data={hex}";
+                var index = Interlocked.Increment(ref _recentHitPacketIndex);
+                _recentHitPackets[index % _recentHitPackets.Length] = entry;
+            }
+            catch
+            {
+                // Diagnostic helper should never throw into caller.
+            }
         }
 
         // ───────────────────── Internal API ────────────────────────
@@ -109,6 +192,17 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                 ushort masked = (ushort)(raw & 0x7FFF);
                 var cls = ClassFromAppearance(c.Appearance);
 
+                // Capture any active effects from the packet
+                if (c.EffectCount > 0)
+                {
+                    for (int e = 0; e < c.EffectCount; e++)
+                    {
+                        byte effectId = c[e].Id;
+                        _characterState.ActivateBuff(effectId, raw);
+                        ElfBuffEffectManager.Instance?.HandleBuff(effectId, raw, true);
+                    }
+                }
+
                 // Always update the manager, even for the local player
                 _scopeManager.AddOrUpdatePlayerInScope(masked, raw, c.CurrentPositionX, c.CurrentPositionY, c.Name);
 
@@ -141,17 +235,8 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             int raw = (app[0] >> 3) & 0b1_1111;
             return raw switch
             {
-                0 => CharacterClassNumber.DarkWizard,
-                1 => CharacterClassNumber.SoulMaster,
-                2 => CharacterClassNumber.GrandMaster,
-                4 => CharacterClassNumber.DarkKnight,
-                6 => CharacterClassNumber.BladeKnight,
-                8 => CharacterClassNumber.FairyElf,
-                10 => CharacterClassNumber.MuseElf,
-                12 => CharacterClassNumber.MagicGladiator,
-                16 => CharacterClassNumber.DarkLord,
-                20 => CharacterClassNumber.Summoner,
-                24 => CharacterClassNumber.RageFighter,
+                0 or 2 or 3 or 4 or 6 or 7 or 8 or 10 or 11 or 12 or 13 or
+                16 or 17 or 20 or 22 or 23 or 24 or 25 => (CharacterClassNumber)raw,
                 _ => CharacterClassNumber.DarkWizard
             };
         }
@@ -210,18 +295,19 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             };
             _logger.LogDebug($"[Spawn] PlayerObject created for {name}.");
 
+            var preloadTask = p.PreloadAppearanceModelsAsync();
+
             // Load assets in background
             try
             {
-                await p.Load();
-                _logger.LogDebug($"[Spawn] p.Load() completed for {name}.");
-                // Skip preloading to avoid blocking
-                _logger.LogDebug($"[Spawn] Skipping preloading for {name}.");
+                var loadTask = p.Load();
+                await Task.WhenAll(preloadTask, loadTask);
+                _logger.LogDebug($"[Spawn] Assets preloaded and Load() completed for {name}.");
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"[Spawn] Error loading assets for {name} ({maskedId:X4}).");
-                p.Dispose();
+                MuGame.ScheduleOnMainThread(() => p.Dispose());
                 return;
             }
 
@@ -240,11 +326,10 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                 {
                     _logger.LogWarning($"[Spawn] Stale object for {name} found. Removing before adding new.");
                     world.Objects.Remove(existingWalker);
-                    // Dispose asynchronously to avoid blocking
-                    _ = Task.Run(() => existingWalker.Dispose());
+                    existingWalker.Dispose();
                 }
 
-                if (world.Objects.OfType<PlayerObject>().FirstOrDefault(pl => pl.NetworkId == maskedId) != null)
+                if (world.FindPlayerById(maskedId) != null)
                 {
                     _logger.LogWarning($"[Spawn] PlayerObject for {name} already exists. Aborting.");
                     p.Dispose();
@@ -253,6 +338,8 @@ namespace Client.Main.Networking.PacketHandling.Handlers
 
                 world.Objects.Add(p);
                 _logger.LogDebug($"[Spawn] Added {name} to world.Objects.");
+
+                ElfBuffEffectManager.Instance?.EnsureBuffsForPlayer(maskedId);
 
                 // Set final position
                 if (p.World != null && p.World.Terrain != null)
@@ -274,18 +361,18 @@ namespace Client.Main.Networking.PacketHandling.Handlers
         [PacketHandler(0x13, PacketRouter.NoSubCode)] // AddNpcToScope
         public Task HandleAddNpcToScopeAsync(Memory<byte> packet)
         {
-            _ = ParseAndAddNpcsToScopeWithStaggeringAsync(packet.ToArray());
+            ParseAndQueueNpcSpawns(packet.ToArray());
             return Task.CompletedTask;
         }
 
         [PacketHandler(0x16, PacketRouter.NoSubCode)] // AddMonstersToScope
         public Task HandleAddMonstersToScopeAsync(Memory<byte> packet)
         {
-            _ = ParseAndAddNpcsToScopeWithStaggeringAsync(packet.ToArray());
+            ParseAndQueueNpcSpawns(packet.ToArray());
             return Task.CompletedTask;
         }
 
-        private async Task ParseAndAddNpcsToScopeWithStaggeringAsync(byte[] packetData)
+        private void ParseAndQueueNpcSpawns(byte[] packetData)
         {
             Memory<byte> packet = packetData;
             int npcCount = 0, firstOffset = 0, dataSize = 0;
@@ -321,8 +408,8 @@ namespace Client.Main.Networking.PacketHandling.Handlers
 
             _logger.LogInformation("ScopeHandler: AddNpcToScope received {Count} objects.", npcCount);
 
-            var spawnTasks = new List<Task>();
             int currentPacketOffset = firstOffset;
+            ushort currentMapId = _characterState.MapId;
 
             for (int i = 0; i < npcCount; i++)
             {
@@ -340,24 +427,69 @@ namespace Client.Main.Networking.PacketHandling.Handlers
 
                 _scopeManager.AddOrUpdateNpcInScope(maskedId, rawId, x, y, type, name);
 
-                // Process NPC/Monster spawning asynchronously without blocking
-                spawnTasks.Add(ProcessNpcSpawnAsync(maskedId, rawId, x, y, direction, type, name));
-
-                // Process in batches to avoid overwhelming the system
-                if (spawnTasks.Count >= 10)
-                {
-                    await Task.WhenAll(spawnTasks);
-                    spawnTasks.Clear();
-                    // Small delay to prevent overwhelming the system
-                    await Task.Delay(1);
-                }
+                _npcSpawnQueue.Enqueue(new NpcSpawnRequest(maskedId, rawId, x, y, direction, type, name, currentMapId));
             }
+        }
 
-            // Process remaining tasks
-            if (spawnTasks.Count > 0)
+        internal static void PumpNpcSpawnQueue(WalkableWorldControl world, int maxPerFrame = MaxNpcSpawnsPerFrame)
+        {
+            if (world == null || world.Status != GameControlStatus.Ready)
             {
-                await Task.WhenAll(spawnTasks);
+                return;
             }
+
+            var handler = _activeInstance;
+            if (handler == null || _npcSpawnQueue.IsEmpty)
+            {
+                return;
+            }
+
+            int startedThisFrame = 0;
+            while (startedThisFrame < maxPerFrame
+                && Volatile.Read(ref _npcSpawnsInFlight) < MaxConcurrentNpcSpawns
+                && _npcSpawnQueue.TryDequeue(out var request))
+            {
+                if (request.MapId != handler._characterState.MapId)
+                {
+                    handler._logger.LogDebug("Discarding queued NPC/Monster spawn {SpawnId:X4} for map {RequestMap} after map changed to {CurrentMap}.", request.MaskedId, request.MapId, handler._characterState.MapId);
+                    continue;
+                }
+
+                startedThisFrame++;
+                handler.StartNpcSpawn(request);
+            }
+        }
+
+        private void StartNpcSpawn(NpcSpawnRequest request)
+        {
+            if (request.MapId != _characterState.MapId)
+            {
+                _logger.LogDebug("Skipping queued NPC/Monster spawn {SpawnId:X4} for stale map {RequestMap} (current: {CurrentMap}).", request.MaskedId, request.MapId, _characterState.MapId);
+                return;
+            }
+
+            Interlocked.Increment(ref _npcSpawnsInFlight);
+
+            _ = ProcessNpcSpawnAsync(request).ContinueWith(t =>
+            {
+                if (t.IsFaulted && t.Exception != null)
+                {
+                    _logger.LogError(t.Exception, "ScopeHandler: Error processing NPC/Monster spawn {SpawnId:X4}.", request.MaskedId);
+                }
+
+                Interlocked.Decrement(ref _npcSpawnsInFlight);
+            }, global::System.Threading.Tasks.TaskScheduler.Default);
+        }
+
+        private Task ProcessNpcSpawnAsync(NpcSpawnRequest request)
+        {
+            if (request.MapId != _characterState.MapId)
+            {
+                _logger.LogDebug("Dropping NPC/Monster spawn {SpawnId:X4} queued for map {RequestMap} after map changed to {CurrentMap}.", request.MaskedId, request.MapId, _characterState.MapId);
+                return Task.CompletedTask;
+            }
+
+            return ProcessNpcSpawnAsync(request.MaskedId, request.RawId, request.X, request.Y, request.Direction, request.Type, request.Name);
         }
 
         private async Task ProcessNpcSpawnAsync(ushort maskedId, ushort rawId, byte x, byte y, byte direction, ushort type, string name)
@@ -368,7 +500,7 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                 {
                     if (!_pendingNpcsMonsters.Any(p => p.Id == maskedId))
                     {
-                        _pendingNpcsMonsters.Add(new NpcScopeObject(maskedId, rawId, x, y, type, name) { Direction = direction });
+                        _pendingNpcsMonsters.Add(new NpcScopeObject(maskedId, rawId, x, y, type, name) { Direction = (byte)MapServerDirection(direction) });
                     }
                 }
                 return;
@@ -389,7 +521,7 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             // Configure the object's properties
             obj.NetworkId = maskedId;
             obj.Location = new Vector2(x, y);
-            obj.Direction = (Client.Main.Models.Direction)direction;
+            obj.Direction = MapServerDirection(direction);
             obj.World = worldRef;
 
             // Load assets in background
@@ -409,7 +541,7 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"ScopeHandler: Error loading NPC/Monster {maskedId} ({obj.GetType().Name}).");
-                obj.Dispose();
+                MuGame.ScheduleOnMainThread(() => obj.Dispose());
                 return;
             }
 
@@ -428,17 +560,12 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                 {
                     _logger.LogWarning($"ScopeHandler: Stale/Duplicate NPC/Monster ID {maskedId:X4} ({existingWalker.GetType().Name}) found in WalkerObjectsById. Removing it before adding new {name} (Type: {type}).");
 
-                    // Remove and dispose asynchronously to avoid blocking
-                    _ = Task.Run(() =>
-                    {
-                        existingWalker.Dispose();
-                    });
+                    existingWalker.Dispose();
                     worldRef.Objects.Remove(existingWalker);
                 }
 
-                // Quick check for duplicates using LINQ
-                var duplicate = worldRef.Objects.OfType<WalkerObject>().FirstOrDefault(o => o.NetworkId == maskedId);
-                if (duplicate != null)
+                // Quick check for duplicates using cached walkers
+                if (worldRef.FindWalkerById(maskedId) != null)
                 {
                     obj.Dispose();
                     return;
@@ -460,7 +587,44 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     obj.MoveTargetPosition = new Vector3(worldX, worldY, 0);
                     obj.Position = obj.MoveTargetPosition;
                 }
+
+                // Play Appear animation for monsters that have MonsterActionType.Appear mapped
+                if (obj is MonsterObject monster && obj is ModelObject modelObj)
+                {
+                    // Check if monster has Appear animation available
+                    if (modelObj.Model?.Actions != null &&
+                        (int)MonsterActionType.Appear < modelObj.Model.Actions.Length &&
+                        modelObj.Model.Actions[(int)MonsterActionType.Appear] != null)
+                    {
+                        // Play MonsterActionType.Appear animation for dramatic spawn effect
+                        monster.PlayAction((ushort)MonsterActionType.Appear);
+                    }
+                }
             });
+        }
+
+        private readonly struct NpcSpawnRequest
+        {
+            public NpcSpawnRequest(ushort maskedId, ushort rawId, byte x, byte y, byte direction, ushort type, string name, ushort mapId)
+            {
+                MaskedId = maskedId;
+                RawId = rawId;
+                X = x;
+                Y = y;
+                Direction = direction;
+                Type = type;
+                Name = name;
+                MapId = mapId;
+            }
+
+            public ushort MaskedId { get; }
+            public ushort RawId { get; }
+            public byte X { get; }
+            public byte Y { get; }
+            public byte Direction { get; }
+            public ushort Type { get; }
+            public string Name { get; }
+            public ushort MapId { get; }
         }
 
         [PacketHandler(0x25, PacketRouter.NoSubCode)]
@@ -468,60 +632,131 @@ namespace Client.Main.Networking.PacketHandling.Handlers
         {
             try
             {
-                const int EXPECTED_MIN_LENGTH = 13;
                 const byte UNEQUIP_MARKER = 0xFF;
                 const ushort ID_MASK = 0x7FFF;
-                const int OBJECT_ID_OFFSET = 3;
-                const int ITEM_GROUP_OFFSET = 5;
-                const int SLOT_AND_GLOW_OFFSET = 6;
-                const int ITEM_OPTIONS_OFFSET = 8;
-                const int EXCELLENT_FLAGS_OFFSET = 9;
-                const int ANCIENT_DISCRIMINATOR_OFFSET = 10;
-                const int ANCIENT_SET_COMPLETE_OFFSET = 11;
+
+                var span = packet.Span;
+
+                // Season 6 servers can send two variants:
+                // - Standard AppearanceChanged (length 13): player id + 8 bytes packed item appearance.
+                // - AppearanceChangedExtended (length 14): explicit slot/group/number/level fields.
+                if (span.Length == 14)
+                {
+                    const int EXT_PLAYER_ID_OFFSET = 4;
+                    const int EXT_ITEM_SLOT_OFFSET = 6;
+                    const int EXT_ITEM_GROUP_OFFSET = 7;
+                    const int EXT_ITEM_NUMBER_OFFSET = 8;
+                    const int EXT_ITEM_LEVEL_OFFSET = 10;
+                    const int EXT_EXCELLENT_FLAGS_OFFSET = 11;
+                    const int EXT_ANCIENT_DISCRIMINATOR_OFFSET = 12;
+                    const int EXT_SET_COMPLETE_OFFSET = 13;
+
+                    ushort extRawKey = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(EXT_PLAYER_ID_OFFSET, 2));
+                    ushort extMaskedId = (ushort)(extRawKey & ID_MASK);
+
+                    byte extItemSlot = span[EXT_ITEM_SLOT_OFFSET];
+                    byte extItemGroup = span[EXT_ITEM_GROUP_OFFSET];
+
+                    if (extItemGroup == UNEQUIP_MARKER)
+                    {
+                        await HandleUnequipAsync(extMaskedId, extItemSlot);
+                        return;
+                    }
+
+                    ushort extItemNumber = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(EXT_ITEM_NUMBER_OFFSET, 2));
+                    byte extItemLevel = span[EXT_ITEM_LEVEL_OFFSET];
+                    byte extExcellentFlags = span[EXT_EXCELLENT_FLAGS_OFFSET];
+                    byte extAncientDiscriminator = span[EXT_ANCIENT_DISCRIMINATOR_OFFSET];
+                    bool extIsAncientSetComplete = span[EXT_SET_COMPLETE_OFFSET] != 0;
+
+                    const int EXT_MAX_ITEM_INDEX = 512;
+                    int extFinalItemType = (extItemGroup * EXT_MAX_ITEM_INDEX) + extItemNumber;
+
+                    _logger.LogDebug("Parsed AppearanceChangedExtended for ID {Id:X4}: Slot={Slot}, Group={Group}, Number={Number}, Type={Type}, Level={Level}",
+                        extMaskedId, extItemSlot, extItemGroup, extItemNumber, extFinalItemType, extItemLevel);
+
+                    _logger.LogInformation("[ScopeHandler] AppearanceChangedExtended ID {Id:X4}: ExcFlags=0x{ExcFlags:X2}, AncDisc=0x{AncDisc:X2}, SetComplete={SetComplete}",
+                        extMaskedId, extExcellentFlags, extAncientDiscriminator, extIsAncientSetComplete);
+
+                    await HandleEquipAsync(extMaskedId, extItemSlot, extItemGroup, extItemNumber, extFinalItemType, extItemLevel,
+                        itemOptions: 0, extExcellentFlags, extAncientDiscriminator, extIsAncientSetComplete);
+                    return;
+                }
+
+                // Standard packed variant.
+                const int STD_MIN_LENGTH = 7; // header(3) + id(2) + at least 2 bytes of item data
+                const int STD_PLAYER_ID_OFFSET = 3;
+                const int STD_ITEM_DATA_OFFSET = 5;
                 const int WEAPON_SLOT_THRESHOLD = 2;
                 const int WEAPON_GROUP = 0;
                 const int ARMOR_GROUP_OFFSET = 5;
 
-                if (packet.Length < EXPECTED_MIN_LENGTH)
+                if (span.Length < STD_MIN_LENGTH)
                 {
-                    _logger.LogWarning("AppearanceChanged packet has invalid length: {Length}. Expected at least {Expected}.", packet.Length, EXPECTED_MIN_LENGTH);
-                        }
-
-                var span = packet.Span;
-                ushort rawKey = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(span.Slice(OBJECT_ID_OFFSET));
-                ushort maskedId = (ushort)(rawKey & ID_MASK);
-
-                bool isUnequip = span[ITEM_GROUP_OFFSET] == UNEQUIP_MARKER;
-                byte itemSlot = (byte)((span[SLOT_AND_GLOW_OFFSET] >> 4) & 0x0F);
-
-                if (isUnequip)
-                {
-                    await HandleUnequipAsync(maskedId, itemSlot);
+                    _logger.LogWarning("AppearanceChanged packet (0x25) too short: {Length}.", span.Length);
                     return;
                 }
 
-                byte glowLevel = (byte)(span[SLOT_AND_GLOW_OFFSET] & 0x0F);
-                byte itemGroup = itemSlot < WEAPON_SLOT_THRESHOLD ? (byte)WEAPON_GROUP : (byte)(itemSlot + ARMOR_GROUP_OFFSET);
-                byte itemNumber = (byte)(span[ITEM_GROUP_OFFSET] & 0x0F);
+                ushort stdRawKey = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(span.Slice(STD_PLAYER_ID_OFFSET, 2));
+                ushort stdMaskedId = (ushort)(stdRawKey & ID_MASK);
+
+                var itemData = span.Slice(STD_ITEM_DATA_OFFSET);
+                if (itemData.Length < 2)
+                {
+                    _logger.LogWarning("AppearanceChanged packet (0x25) item data too short: {Length}.", itemData.Length);
+                    return;
+                }
+
+                byte itemSlot = (byte)((itemData[1] >> 4) & 0x0F);
+
+                if (itemData[0] == UNEQUIP_MARKER)
+                {
+                    await HandleUnequipAsync(stdMaskedId, itemSlot);
+                    return;
+                }
+
+                byte glowLevel = (byte)(itemData[1] & 0x0F);
+
+                ushort itemNumber = itemData[0];
+                byte itemGroup;
+
+                if (itemSlot < WEAPON_SLOT_THRESHOLD)
+                {
+                    // For weapon slots the group is encoded in itemData[2] high nibble,
+                    // and the item number high bits in its low nibble (same layout as viewport equipment).
+                    if (itemData.Length > 2)
+                    {
+                        itemGroup = (byte)((itemData[2] >> 4) & 0x0F);
+                        itemNumber = (ushort)(itemNumber | ((itemData[2] & 0x0F) << 8));
+                    }
+                    else
+                    {
+                        itemGroup = (byte)WEAPON_GROUP;
+                    }
+                }
+                else
+                {
+                    itemGroup = (byte)(itemSlot + ARMOR_GROUP_OFFSET);
+                }
+
                 byte itemLevel = ConvertGlowToItemLevel(glowLevel);
 
-                byte itemOptions = span[ITEM_OPTIONS_OFFSET];
-                byte excellentFlags = span[EXCELLENT_FLAGS_OFFSET];
-                byte ancientDiscriminator = span[ANCIENT_DISCRIMINATOR_OFFSET];
-                bool isAncientSetComplete = span[ANCIENT_SET_COMPLETE_OFFSET] != 0;
-
-                bool hasExcellent = excellentFlags != 0;
-                bool hasAncient = ancientDiscriminator != 0 && excellentFlags != 0;
+                byte itemOptions = itemData.Length > 3 ? itemData[3] : (byte)0;
+                byte excellentFlags = itemData.Length > 4 ? itemData[4] : (byte)0;
+                byte ancientDiscriminator = itemData.Length > 5 ? itemData[5] : (byte)0;
+                bool isAncientSetComplete = itemData.Length > 6 && itemData[6] != 0;
 
                 const int MAX_ITEM_INDEX = 512;
                 int finalItemType = (itemGroup * MAX_ITEM_INDEX) + itemNumber;
 
                 _logger.LogDebug("Parsed AppearanceChanged for ID {Id:X4}: Slot={Slot}, Group={Group}, Number={Number}, Type={Type}, Level={Level}",
-                    maskedId, itemSlot, itemGroup, itemNumber, finalItemType, itemLevel);
+                    stdMaskedId, itemSlot, itemGroup, itemNumber, finalItemType, itemLevel);
 
-                await HandleEquipAsync(maskedId, itemSlot, itemGroup, itemNumber, finalItemType, itemLevel, 
-                    itemOptions, hasExcellent ? excellentFlags : (byte)0, 
-                    hasAncient ? ancientDiscriminator : (byte)0, isAncientSetComplete);
+                _logger.LogInformation("[ScopeHandler] AppearanceChanged ID {Id:X4}: ExcFlags=0x{ExcFlags:X2}, AncDisc=0x{AncDisc:X2}, SetComplete={SetComplete}",
+                    stdMaskedId, excellentFlags, ancientDiscriminator, isAncientSetComplete);
+
+                await HandleEquipAsync(stdMaskedId, itemSlot, itemGroup, itemNumber, finalItemType, itemLevel,
+                    itemOptions, excellentFlags, ancientDiscriminator, isAncientSetComplete);
             }
             catch (Exception ex)
             {
@@ -558,8 +793,8 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             return Task.CompletedTask;
         }
 
-        private Task HandleEquipAsync(ushort maskedId, byte itemSlot, byte itemGroup, byte itemNumber, 
-            int finalItemType, byte itemLevel, byte itemOptions, byte excellentFlags, 
+        private Task HandleEquipAsync(ushort maskedId, byte itemSlot, byte itemGroup, ushort itemNumber,
+            int finalItemType, byte itemLevel, byte itemOptions, byte excellentFlags,
             byte ancientDiscriminator, bool isAncientSetComplete)
         {
             MuGame.ScheduleOnMainThread(async () =>
@@ -595,24 +830,77 @@ namespace Client.Main.Networking.PacketHandling.Handlers
         {
             try
             {
-                if (packet.Length < ObjectHit.Length)
+                RecordHitPacket(packet.Span);
+
+                bool isExtendedPacket = packet.Length >= ObjectHitExtended.Length;
+                ushort rawId;
+                uint healthDmg;
+                uint shieldDmg;
+                DamageKind damageKind;
+                bool isDoubleDamage;
+                bool isTripleDamage;
+                byte? healthStatus = null;
+                byte? shieldStatus = null;
+
+                if (isExtendedPacket)
                 {
-                    _logger.LogWarning("ObjectHit packet (0x11) too short: {Length}", packet.Length);
-                    return Task.CompletedTask;
+                    var extended = new ObjectHitExtended(packet);
+                    rawId = extended.ObjectId;
+                    healthDmg = extended.HealthDamage;
+                    shieldDmg = extended.ShieldDamage;
+                    damageKind = extended.Kind;
+                    isDoubleDamage = extended.IsDoubleDamage;
+                    isTripleDamage = extended.IsTripleDamage;
+                    healthStatus = extended.HealthStatus;
+                    shieldStatus = extended.ShieldStatus;
+                }
+                else
+                {
+                    if (packet.Length < ObjectHit.Length)
+                    {
+                        _logger.LogWarning("ObjectHit packet (0x11) too short: {Length}", packet.Length);
+                        return Task.CompletedTask;
+                    }
+
+                    var hitInfo = new ObjectHit(packet);
+                    rawId = hitInfo.ObjectId;
+                    healthDmg = hitInfo.HealthDamage;
+                    shieldDmg = hitInfo.ShieldDamage;
+                    damageKind = hitInfo.Kind;
+                    isDoubleDamage = hitInfo.IsDoubleDamage;
+                    isTripleDamage = hitInfo.IsTripleDamage;
                 }
 
-                var hitInfo = new ObjectHit(packet);
-                ushort rawId = hitInfo.ObjectId;
                 ushort maskedId = (ushort)(rawId & 0x7FFF);
-                uint healthDmg = hitInfo.HealthDamage;
-                uint shieldDmg = hitInfo.ShieldDamage;
                 uint totalDmg = healthDmg + shieldDmg;
 
-                // Log damage event
+                float? healthFraction = null;
+                float? shieldFraction = null;
+                const float statusScale = 1f / 255f;
+
+                if (healthStatus is { } hs && hs != byte.MaxValue)
+                {
+                    healthFraction = Math.Clamp(hs * statusScale, 0f, 1f);
+                }
+                else if (healthStatus.HasValue)
+                {
+                    _logger.LogDebug("ObjectHit 0x11: HealthStatus unknown (0xFF) for {Id:X4}.", maskedId);
+                }
+                else
+                {
+                    _logger.LogDebug("ObjectHit 0x11: HealthStatus missing (short packet) for {Id:X4}.", maskedId);
+                }
+
+                if (shieldStatus is { } ss && ss != byte.MaxValue)
+                {
+                    shieldFraction = Math.Clamp(ss * statusScale, 0f, 1f);
+                }
+
+                // Log damage event with type information
                 string objectName = _scopeManager.TryGetScopeObjectName(maskedId, out var nm) ? (nm ?? "Object") : "Object";
                 _logger.LogInformation(
-                    "💥 {ObjectName} (ID: {Id:X4}) received hit: HP {HpDmg}, SD {SdDmg}",
-                    objectName, maskedId, healthDmg, shieldDmg
+                    "💥 {ObjectName} (ID: {Id:X4}) received hit: HP {HpDmg}, SD {SdDmg}, Type: {DamageKind}, 2x: {IsDouble}, 3x: {IsTriple}",
+                    objectName, maskedId, healthDmg, shieldDmg, damageKind, isDoubleDamage, isTripleDamage
                 );
 
                 // Display floating damage text on the main thread
@@ -643,22 +931,56 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     var headPos = target.WorldPosition.Translation
                                 + Vector3.UnitZ * (target.BoundingBoxWorld.Max.Z - target.WorldPosition.Translation.Z + 30f);
 
+                    if (target is MonsterObject monster)
+                    {
+                        monster.UpdateHealthFractions(healthFraction, shieldFraction, healthDmg, shieldDmg);
+                    }
+
+                    // Use server-provided damage type for authentic MU Online colors
                     Color dmgColor;
+                    string dmgText;
+
                     if (totalDmg == 0)
                     {
                         dmgColor = Color.White;
-                    }
-                    else if (maskedId == _characterState.Id)
-                    {
-                        dmgColor = Color.Red;
+                        dmgText = "Miss";
                     }
                     else
                     {
-                        dmgColor = Color.Orange;
+                        // Local player damage is always red, others use server-provided damage type colors
+                        if (maskedId == _characterState.Id)
+                        {
+                            dmgColor = Color.Red;
+                        }
+                        else
+                        {
+                            // Map DamageKind to colors for other players/monsters
+                            dmgColor = damageKind switch
+                            {
+                                DamageKind.NormalRed => Color.Orange,
+                                DamageKind.IgnoreDefenseCyan => Color.Cyan,
+                                DamageKind.ExcellentLightGreen => Color.LightGreen,
+                                DamageKind.CriticalBlue => Color.DeepSkyBlue,
+                                DamageKind.LightPink => Color.LightPink,
+                                DamageKind.PoisonDarkGreen => Color.DarkGreen,
+                                DamageKind.ReflectedDarkPink => Color.DeepPink,
+                                DamageKind.White => Color.White,
+                                _ => Color.Red // fallback to normal red
+                            };
+                        }
+
+                        // Add damage multiplier indicators for double/triple damage
+                        string multiplier = "";
+                        if (isTripleDamage)
+                            multiplier = "!!!";
+                        else if (isDoubleDamage)
+                            multiplier = "!!";
+
+                        dmgText = $"{totalDmg}{multiplier}";
                     }
 
-                    var txt = new DamageTextObject(
-                        totalDmg == 0 ? "Miss" : totalDmg.ToString(),
+                    var txt = DamageTextObject.Rent(
+                        dmgText,
                         maskedId,
                         dmgColor
                     );
@@ -754,29 +1076,42 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     _logger.LogWarning("ItemsDropped packet too short: {Length}", packet.Length);
                     return;
                 }
-                var droppedItems = new ItemsDropped(packet);
-                _logger.LogInformation("Received ItemsDropped (S6+): {Count} items.", droppedItems.ItemCount);
+                byte itemCount = packet.Span[4];
+                _logger.LogInformation("Received ItemsDropped (S6+): {Count} items.", itemCount);
 
-                int dataLength = 12; // typical for S6
-                int structSize = ItemsDropped.DroppedItem.GetRequiredSize(dataLength);
                 int offset = PrefixSize;
-
-                for (int i = 0; i < droppedItems.ItemCount; i++, offset += structSize)
+                for (int i = 0; i < itemCount; i++)
                 {
-                    if (offset + structSize > packet.Length)
+                    if (offset + 4 > packet.Length)
                     {
                         _logger.LogWarning("Packet too short for item {Index}.", i);
                         break;
                     }
 
-                    var itemMem = packet.Slice(offset, structSize);
-                    var item = new ItemsDropped.DroppedItem(itemMem);
-                    ushort rawId = item.Id;
+                    ushort rawId = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(packet.Span.Slice(offset, 2));
                     ushort maskedId = (ushort)(rawId & 0x7FFF);
-                    byte x = item.PositionX;
-                    byte y = item.PositionY;
-                    var data = item.ItemData;
-                    bool isMoney = data.Length >= 6 && data[0] == 15 && (data[5] >> 4) == 14; // Money is ItemGroup 14, ItemId 15
+                    byte x = packet.Span[offset + 2];
+                    byte y = packet.Span[offset + 3];
+                    int itemDataOffset = offset + 4;
+
+                    if (itemDataOffset >= packet.Length)
+                    {
+                        _logger.LogWarning("Packet missing item data for item {Index}.", i);
+                        break;
+                    }
+
+                    ReadOnlySpan<byte> itemSpan = packet.Span.Slice(itemDataOffset);
+                    if (!ItemDataParser.TryGetExtendedItemLength(itemSpan, out int itemLen) || itemDataOffset + itemLen > packet.Length)
+                    {
+                        itemLen = Math.Min(itemSpan.Length, 12);
+                    }
+
+                    var data = itemSpan.Slice(0, itemLen);
+                    offset = itemDataOffset + itemLen;
+
+                    bool isMoney = ItemDataParser.TryGetGroupAndNumber(data, out var group, out var number)
+                                   && group == 14
+                                   && number == 15;
                     ScopeObject dropObj;
 
                     if (isMoney)
@@ -801,8 +1136,9 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     }
                     else
                     {
-                        dropObj = new ItemScopeObject(maskedId, rawId, x, y, data.ToArray());
-                        _scopeManager.AddOrUpdateItemInScope(maskedId, rawId, x, y, data.ToArray());
+                        byte[] dataCopy = data.ToArray();
+                        dropObj = new ItemScopeObject(maskedId, rawId, x, y, dataCopy);
+                        _scopeManager.AddOrUpdateItemInScope(maskedId, rawId, x, y, dataCopy);
                         _logger.LogDebug("Dropped Item: ID={Id:X4}, DataLen={Len}", maskedId, data.Length);
 
                         // Process dropped item asynchronously
@@ -810,10 +1146,9 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                         {
                             try
                             {
-                                byte[] dataCopy = item.ItemData.ToArray();
                                 string itemName = ItemDatabase.GetItemName(dataCopy) ?? string.Empty;
                                 string soundPath = itemName.StartsWith("Jewel", StringComparison.OrdinalIgnoreCase)
-                                    ? "Sound/pGem.wav"
+                                    ? "Sound/eGem.wav"
                                     : "Sound/pDropItem.wav";
 
                                 await ProcessDroppedItemAsync(dropObj, maskedId, soundPath);
@@ -882,7 +1217,7 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                                     var newScopeObject = new ItemScopeObject(maskedId, rawId, x, y, data);
                                     string itemName = ItemDatabase.GetItemName(data) ?? string.Empty;
                                     string soundPath = itemName.StartsWith("Jewel", StringComparison.OrdinalIgnoreCase)
-                                        ? "Sound/pGem.wav"
+                                        ? "Sound/eGem.wav"
                                         : "Sound/pDropItem.wav";
 
                                     await ProcessDroppedItemAsync(newScopeObject, maskedId, soundPath);
@@ -977,14 +1312,11 @@ namespace Client.Main.Networking.PacketHandling.Handlers
 
                     foreach (var masked in objectsToRemove)
                     {
-                        var obj = world.Objects
-                                       .OfType<DroppedItemObject>()
-                                       .FirstOrDefault(d => d.NetworkId == masked);
+                        var obj = world.FindDroppedItemById(masked);
                         if (obj != null)
                         {
                             world.Objects.Remove(obj);
-                            // Dispose asynchronously to avoid blocking
-                            _ = Task.Run(() => obj.Dispose());
+                            obj.Recycle();
                             _logger.LogDebug("Removed DroppedItemObject {Id:X4} from world (scope gone).", masked);
                         }
                     }
@@ -1045,38 +1377,29 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     foreach (var masked in objectsToRemove)
                     {
                         // ---- 1) Player --------------------------------------------------
-                        var player = world.Objects
-                                          .OfType<PlayerObject>()
-                                          .FirstOrDefault(p => p.NetworkId == masked);
+                        var player = world.FindPlayerById(masked);
                         if (player != null)
                         {
                             world.Objects.Remove(player);
-                            // Dispose asynchronously to avoid blocking
-                            _ = Task.Run(() => player.Dispose());
+                            player.Dispose();
                             continue;
                         }
 
                         // ---- 2) Walker / NPC --------------------------------------------
-                        var walker = world.Objects
-                                          .OfType<WalkerObject>()
-                                          .FirstOrDefault(w => w.NetworkId == masked);
+                        var walker = world.FindWalkerById(masked);
                         if (walker != null)
                         {
                             world.Objects.Remove(walker);
-                            // Dispose asynchronously to avoid blocking
-                            _ = Task.Run(() => walker.Dispose());
+                            walker.Dispose();
                             continue;
                         }
 
                         // ---- 3) Dropped item --------------------------------------------
-                        var drop = world.Objects
-                                         .OfType<DroppedItemObject>()
-                                         .FirstOrDefault(d => d.NetworkId == masked);
+                        var drop = world.FindDroppedItemById(masked);
                         if (drop != null)
                         {
                             world.Objects.Remove(drop);
-                            // Dispose asynchronously to avoid blocking
-                            _ = Task.Run(() => drop.Dispose());
+                            drop.Dispose();
                         }
                     }
                 });
@@ -1111,8 +1434,7 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                 {
                     if (MuGame.Instance.ActiveScene?.World is WalkableWorldControl world)
                     {
-                        var objToMove = world.Objects.OfType<WalkerObject>()
-                                            .FirstOrDefault(w => w.NetworkId == maskedId);
+                        var objToMove = world.FindWalkerById(maskedId);
                         if (objToMove != null)
                         {
                             objToMove.Location = new Vector2(x, y);
@@ -1139,12 +1461,36 @@ namespace Client.Main.Networking.PacketHandling.Handlers
         {
             if (packet.Length < 7) return Task.CompletedTask;
 
-            var walk = new ObjectWalked(packet);
-            ushort raw = walk.ObjectId;
-            ushort maskedId = (ushort)(raw & 0x7FFF);
-            byte x = walk.TargetX, y = walk.TargetY;
+            ushort raw;
+            ushort maskedId;
+            byte x, y;
+
+            if (_useExtendedWalkFormat && packet.Length >= ObjectWalkedExtended.GetRequiredSize(0))
+            {
+                // Server sends ObjectWalkedExtended for client versions >= 1.06.3 (e.g. 2.04d).
+                // Bytes [5-6] = SourceX/Y, [7-8] = TargetX/Y.
+                var walkExtended = new ObjectWalkedExtended(packet);
+                raw = walkExtended.ObjectId;
+                maskedId = (ushort)(raw & 0x7FFF);
+                x = walkExtended.TargetX;
+                y = walkExtended.TargetY;
+            }
+            else
+            {
+                // Server sends ObjectWalked for older client versions (e.g. 1.04d).
+                // Bytes [5-6] = TargetX/Y directly.
+                var walk = new ObjectWalked(packet);
+                raw = walk.ObjectId;
+                maskedId = (ushort)(raw & 0x7FFF);
+                x = walk.TargetX;
+                y = walk.TargetY;
+            }
 
             _scopeManager.TryUpdateScopeObjectPosition(maskedId, x, y);
+            if (maskedId == _characterState.Id)
+            {
+                _characterState.UpdatePosition(x, y);
+            }
 
             MuGame.ScheduleOnMainThread(() =>
             {
@@ -1161,7 +1507,14 @@ namespace Client.Main.Networking.PacketHandling.Handlers
 
                     if (self != null && self.NetworkId == maskedId)
                     {
-                        self.MoveTo(new Vector2(x, y), sendToServer: false);
+                        // Mirror SourceMain behavior: while local movement is in progress,
+                        // ignore delayed walk echoes from server to avoid "one-click-behind" movement.
+                        if (self.MovementIntent || self.IsMoving)
+                        {
+                            return;
+                        }
+
+                        self.MoveTo(new Vector2(x, y), sendToServer: false, usePathfinding: false);
                         return;
                     }
                 }
@@ -1172,7 +1525,7 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     return;
                 }
 
-                walker.MoveTo(new Vector2(x, y), sendToServer: false);
+                walker.MoveTo(new Vector2(x, y), sendToServer: false, usePathfinding: false);
 
                 if (walker is PlayerObject player)
                 {
@@ -1182,9 +1535,18 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     if (world.WorldIndex == 8) // Atlans
                     {
                         var flags = world.Terrain.RequestTerrainFlag(x, y);
-                        walkAction = flags.HasFlag(TWFlags.SafeZone)
-                            ? (isFemale ? PlayerAction.PlayerWalkFemale : PlayerAction.PlayerWalkMale)
-                            : PlayerAction.PlayerRunSwim;
+                        if (flags.HasFlag(TWFlags.SafeZone))
+                        {
+                            walkAction = isFemale ? PlayerAction.PlayerWalkFemale : PlayerAction.PlayerWalkMale;
+                        }
+                        else if (player.HasEquippedWings)
+                        {
+                            walkAction = PlayerAction.PlayerFly;
+                        }
+                        else
+                        {
+                            walkAction = PlayerAction.PlayerRunSwim;
+                        }
                     }
                     else if (world.WorldIndex == 11 || (world.WorldIndex == 1 && player.HasEquippedWings && !world.Terrain.RequestTerrainFlag(x, y).HasFlag(TWFlags.SafeZone)))
                     {
@@ -1253,8 +1615,7 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     if (MuGame.Instance.ActiveScene?.World is not WorldControl world) return;
 
                     // Use same lookup as HandleObjectAnimation
-                    var player = world.Objects.OfType<PlayerObject>()
-                                   .FirstOrDefault(p => p.NetworkId == killed);
+                    var player = world.FindPlayerById(killed);
 
                     WalkerObject walker = null;
                     if (!world.TryGetWalkerById(killed, out walker) && player == null)
@@ -1337,13 +1698,13 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             ushort maskedId = (ushort)(rawId & 0x7FFF);
             byte serverActionId = anim.Animation;
             byte serverDirection = anim.Direction;
+            ushort targetId = anim.TargetId;
 
             MuGame.ScheduleOnMainThread(() =>
             {
                 if (MuGame.Instance.ActiveScene?.World is not WorldControl world) return;
 
-                var player = world.Objects.OfType<PlayerObject>()
-                               .FirstOrDefault(p => p.NetworkId == maskedId);
+                var player = world.FindPlayerById(maskedId);
 
                 if (!world.TryGetWalkerById(maskedId, out var walker) && player == null)
                 {
@@ -1388,6 +1749,11 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     clientActionToPlay = (PlayerAction)action;
                     actionNameForLog = action.ToString();
                     monsterAction = action;
+
+                    if (monsterAction == MonsterActionType.Attack1 || monsterAction == MonsterActionType.Attack2)
+                    {
+                        monsterToAnimate.LastAttackTargetId = targetId;
+                    }
                 }
                 else
                 {
@@ -1395,7 +1761,7 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     return;
                 }
 
-                Client.Main.Models.Direction clientDirection = (Client.Main.Models.Direction)serverDirection;
+                Client.Main.Models.Direction clientDirection = MapServerDirection(serverDirection);
 
                 if (maskedId == _characterState.Id && walker is PlayerObject localPlayer)
                 {
@@ -1408,7 +1774,7 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                 {
                     walker.Direction = clientDirection;
 
-                    walker.PlayAction((ushort)clientActionToPlay, fromServer: true); // <-- Dodaj fromServer: true
+                    walker.PlayAction((ushort)clientActionToPlay, fromServer: true);
 
                     if (walker is MonsterObject monster && monsterAction.HasValue &&
                         (monsterAction == MonsterActionType.Attack1 || monsterAction == MonsterActionType.Attack2))
@@ -1489,7 +1855,7 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             await tcs.Task;
         }
 
-        private async void ProcessDroppedItemOnMainThread(ScopeObject dropObj, ushort maskedId, string soundPath, TaskCompletionSource<bool> tcs)
+        private void ProcessDroppedItemOnMainThread(ScopeObject dropObj, ushort maskedId, string soundPath, TaskCompletionSource<bool> tcs)
         {
             try
             {
@@ -1500,15 +1866,14 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                 }
 
                 // Remove existing visual object if it's already there
-                var existing = world.Objects.OfType<DroppedItemObject>().FirstOrDefault(d => d.NetworkId == maskedId);
+                var existing = world.FindDroppedItemById(maskedId);
                 if (existing != null)
                 {
                     world.Objects.Remove(existing);
-                    // Dispose asynchronously to avoid blocking
-                    _ = Task.Run(() => existing.Dispose());
+                    existing.Recycle();
                 }
 
-                var obj = new DroppedItemObject(dropObj, _characterState.Id, _networkManager.GetCharacterService(), _loggerFactory.CreateLogger<DroppedItemObject>());
+                var obj = DroppedItemObject.Rent(dropObj, _characterState.Id, _networkManager.GetCharacterService(), _loggerFactory.CreateLogger<DroppedItemObject>());
 
                 // Set World property before adding to world objects
                 obj.World = world;
@@ -1516,33 +1881,43 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                 // Add to world so World.Scene is available
                 world.Objects.Add(obj);
 
-                // Load assets
-                try
+                // Queue load to avoid long stalls on the main thread
+                bool enqueued = MuGame.TaskScheduler.QueueTask(async () =>
                 {
-                    await obj.Load();
-                }
-                catch (Exception ex)
+                    try
+                    {
+                        await obj.Load();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, $"Error loading dropped item assets for {maskedId:X4}");
+                        world.Objects.Remove(obj);
+                        obj.Recycle();
+                        tcs.TrySetResult(false);
+                        return;
+                    }
+
+                    // Play drop sound
+                    SoundController.Instance.PlayBufferWithAttenuation(soundPath, obj.Position, world.Walker.Position);
+
+                    // Don't set Hidden immediately - let WorldObject.Update handle visibility checks
+                    // The immediate visibility check was causing items to be Hidden incorrectly
+                    _logger.LogDebug($"Spawned dropped item ({obj.DisplayName}) at {obj.Position.X},{obj.Position.Y},{obj.Position.Z}. RawId: {obj.RawId:X4}, MaskedId: {obj.NetworkId:X4}");
+                    tcs.TrySetResult(true);
+                }, Controllers.TaskScheduler.Priority.Low);
+
+                if (!enqueued)
                 {
-                    _logger.LogError(ex, $"Error loading dropped item assets for {maskedId:X4}");
+                    _logger.LogWarning("Failed to queue dropped item load task for {Id:X4} – scheduler at capacity.", maskedId);
                     world.Objects.Remove(obj);
-                    obj.Dispose();
-                    tcs.SetResult(false);
-                    return;
+                    obj.Recycle();
+                    tcs.TrySetResult(false);
                 }
-
-                // Play drop sound
-                SoundController.Instance.PlayBufferWithAttenuation(soundPath, obj.Position, world.Walker.Position);
-
-                // Initial visibility check
-                obj.Hidden = !world.IsObjectInView(obj);
-                _logger.LogDebug($"Spawned dropped item ({obj.DisplayName}) at {obj.Position.X},{obj.Position.Y},{obj.Position.Z}. RawId: {obj.RawId:X4}, MaskedId: {obj.NetworkId:X4}");
-
-                tcs.SetResult(true);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"Error processing dropped item on main thread for {maskedId:X4}");
-                tcs.SetResult(false);
+                tcs.TrySetResult(false);
             }
         }
 

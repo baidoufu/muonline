@@ -5,11 +5,12 @@ using System;
 using System.Threading.Tasks;
 using Client.Main.Core.Client;
 using Client.Main.Controllers;
-using System.Linq;
 using Client.Main.Controls.UI;
 using Client.Main.Models;
 using Client.Main.Controls;
+using Client.Main.Controls.UI.Game;
 using Client.Main.Objects;
+using MUnique.OpenMU.Network.Packets;
 
 namespace Client.Main.Networking.PacketHandling.Handlers
 {
@@ -74,9 +75,49 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             return Task.CompletedTask;
         }
 
+        [PacketHandler(0x81, PacketRouter.NoSubCode)]  // VaultMoneyUpdate
+        public Task HandleVaultMoneyUpdateAsync(Memory<byte> packet)
+        {
+            try
+            {
+                if (packet.Length < VaultMoneyUpdate.Length)
+                {
+                    _logger.LogWarning("VaultMoneyUpdate packet too short: {Length}", packet.Length);
+                    return Task.CompletedTask;
+                }
+
+                var update = new VaultMoneyUpdate(packet);
+                _logger.LogInformation("VaultMoneyUpdate: Success={Success}, Vault={Vault}, Inventory={Inventory}", update.Success, update.VaultMoney, update.InventoryMoney);
+
+                _characterState.UpdateInventoryZen(update.InventoryMoney);
+
+                MuGame.ScheduleOnMainThread(() =>
+                {
+                    VaultControl.Instance.SetVaultZen(update.VaultMoney);
+
+                    if (!update.Success)
+                    {
+                        RequestDialog.ShowInfo("Vault money transfer failed.");
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error parsing VaultMoneyUpdate packet.");
+            }
+
+            return Task.CompletedTask;
+        }
+
         [PacketHandler(0x22, 0x01)]  // ItemAddedToInventory
         public Task HandleItemAddedToInventoryAsync(Memory<byte> packet)
         {
+            if (_targetVersion >= TargetProtocolVersion.Season6)
+            {
+                // Season 6 extended client uses 0x22 without subcodes (slot is in header value).
+                return Task.CompletedTask;
+            }
+
             byte headerType = packet.Span[0];
             try
             {
@@ -112,7 +153,7 @@ namespace Client.Main.Networking.PacketHandling.Handlers
         {
             try
             {
-                if (packet.Length < 4) // C3 Size Code SubCode/FailReasonByte
+                if (packet.Length < 4) // Header + value/result byte
                 {
                     _logger.LogWarning("ItemPickupFailed-like packet (0x22) too short: {Length}", packet.Length);
                     _characterState.ClearPendingPickedItem(); // Clean up just in case
@@ -120,7 +161,79 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     return Task.CompletedTask;
                 }
 
-                // The byte at index 3 is the sub-code, which in some cases is the FailReason or a slot index.
+                if (_targetVersion >= TargetProtocolVersion.Season6)
+                {
+                    byte value = packet.Span[3];
+                    const byte NotGetItem = 0xFF;
+                    const byte GetItemZen = 0xFE;
+                    const byte GetItemStacked = 0xFD;
+
+                    if (value == NotGetItem)
+                    {
+                        _logger.LogInformation("Item pick-up failed (0x22 value=0xFF).");
+                        ShowPickupChatMessage("Item pick-up failed.");
+                        _characterState.ClearPendingPickedItem();
+                        ResetPendingPickupObject();
+                        return Task.CompletedTask;
+                    }
+
+                    if (value == GetItemZen)
+                    {
+                        if (packet.Length >= InventoryMoneyUpdate.Length)
+                        {
+                            var moneyUpdate = new InventoryMoneyUpdate(packet);
+                            _characterState.UpdateInventoryZen(moneyUpdate.Money);
+                            ShowPickupChatMessage($"Picked up Zen. Total: {moneyUpdate.Money:N0}");
+                        }
+                        else
+                        {
+                            _logger.LogWarning("InventoryMoneyUpdate (0x22 value=0xFE) packet too short: {Length}", packet.Length);
+                        }
+
+                        _characterState.ClearPendingPickedItem();
+                        ResetPendingPickupObject();
+                        return Task.CompletedTask;
+                    }
+
+                    if (value == GetItemStacked)
+                    {
+                        _logger.LogInformation("Item pick-up reported as stacked (0x22 value=0xFD).");
+                        _characterState.ClearPendingPickedItem();
+                        ResetPendingPickupObject();
+                        SoundController.Instance.PlayBuffer("Sound/pGetItem.wav");
+                        return Task.CompletedTask;
+                    }
+
+                    byte targetSlot = value;
+                    int itemDataOffset = 4;
+                    if (packet.Length <= itemDataOffset)
+                    {
+                        _logger.LogWarning("Item pick-up success (slot {Slot}) has no item data.", targetSlot);
+                        ShowPickupChatMessage("Item pick-up error (missing item data).");
+                        _characterState.ClearPendingPickedItem();
+                        ResetPendingPickupObject();
+                        return Task.CompletedTask;
+                    }
+
+                    ReadOnlySpan<byte> itemDataSpan = packet.Span.Slice(itemDataOffset);
+                    int itemLen;
+                    if (!ItemDataParser.TryGetExtendedItemLength(itemDataSpan, out itemLen) || itemDataOffset + itemLen > packet.Length)
+                    {
+                        itemLen = Math.Min(itemDataSpan.Length, 12);
+                    }
+
+                    var itemData = itemDataSpan.Slice(0, itemLen).ToArray();
+                    _characterState.AddOrUpdateInventoryItem(targetSlot, itemData);
+                    _characterState.ClearPendingPickedItem();
+                    string itemName = ItemDatabase.GetItemName(itemData) ?? "Item";
+                    _logger.LogInformation("Item '{ItemName}' picked up successfully into slot {Slot}.", itemName, targetSlot);
+                    ShowPickupChatMessage($"Picked up '{itemName}'.");
+                    SoundController.Instance.PlayBuffer("Sound/pGetItem.wav");
+                    ResetPendingPickupObject();
+                    return Task.CompletedTask;
+                }
+
+                // Legacy behavior: sub-code indicates failure reason or slot.
                 byte subCodeOrSlotByte = packet.Span[3];
                 var failReasonEnum = (ItemPickUpRequestFailed.ItemPickUpFailReason)subCodeOrSlotByte;
 
@@ -142,18 +255,14 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                 }
                 else if (failReasonEnum == ItemPickUpRequestFailed.ItemPickUpFailReason.__MaximumInventoryMoneyReached) // 0xFE
                 {
-                    // This case for money should ideally be handled by InventoryMoneyUpdate.
-                    // If it comes here, it's likely an error or an old server behavior.
                     messageToUser = "Your inventory is full (money limit reached).";
                     _characterState.ClearPendingPickedItem();
                     ResetPendingPickupObject();
                 }
                 else // The byte is NOT a known FailReason enum value, assume it's a slot index for SUCCESS.
                 {
-                    // This packet structure is now like ItemAddedToInventory: C3 Size 22 Slot ItemData...
-                    // packet.Span[3] is the slot. ItemData starts at packet.Span[4].
                     byte targetSlot = subCodeOrSlotByte;
-                    ReadOnlySpan<byte> itemDataSpan = packet.Span.Slice(4); // Item data starts AFTER the slot byte.
+                    ReadOnlySpan<byte> itemDataSpan = packet.Span.Slice(4);
 
                     if (itemDataSpan.IsEmpty)
                     {
@@ -162,11 +271,8 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                         _characterState.ClearPendingPickedItem();
                         ResetPendingPickupObject();
                     }
-                    // Attempt to commit the stashed item.
                     else if (_characterState.CommitStashedItem(targetSlot))
                     {
-                        // Successfully committed the stashed item.
-                        // The item name is now available from the updated CharacterState.
                         string itemName = "Unknown Item";
                         if (_characterState.GetInventoryItems().TryGetValue(targetSlot, out var committedItemData))
                         {
@@ -179,25 +285,17 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     }
                     else
                     {
-                        // CommitStashedItem returned false, likely because _pendingPickedItem was null.
                         _logger.LogError("Failed to commit stashed item for slot {Slot} after receiving 'success' type message (0x22, SubCode={SubCode:X2}). No pending item data was stashed by client?", targetSlot, targetSlot);
                         messageToUser = "Item pick-up error (client state issue).";
-                        // _pendingPickedItem is already null or was never set, so ClearPendingPickedItem is effectively done.
-                        // We still call it to ensure the state is clean if it somehow wasn't null.
                         _characterState.ClearPendingPickedItem();
                         ResetPendingPickupObject();
                     }
                 }
 
-                // If an error message was set, display it.
                 if (!string.IsNullOrEmpty(messageToUser))
                 {
                     _logger.LogWarning("Item Pickup Issue: {Message}", messageToUser);
-                    MuGame.ScheduleOnMainThread(() =>
-                    {
-                        var gameScene = MuGame.Instance?.ActiveScene as Client.Main.Scenes.GameScene;
-                        gameScene?.Controls.OfType<ChatLogWindow>().FirstOrDefault()?.AddMessage("System", messageToUser, uiMessageType);
-                    });
+                    ShowPickupChatMessage(messageToUser, uiMessageType);
                 }
             }
             catch (Exception ex)
@@ -207,6 +305,15 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                 ResetPendingPickupObject();
             }
             return Task.CompletedTask;
+        }
+
+        private void ShowPickupChatMessage(string message, MessageType messageType = MessageType.System)
+        {
+            MuGame.ScheduleOnMainThread(() =>
+            {
+                var gameScene = MuGame.Instance?.ActiveScene as Client.Main.Scenes.GameScene;
+                gameScene?.ChatLog?.AddMessage("System", message, messageType);
+            });
         }
 
         private void ResetPendingPickupObject()
@@ -222,7 +329,17 @@ namespace Client.Main.Networking.PacketHandling.Handlers
                     return;
 
                 ushort masked = (ushort)(rawId.Value & 0x7FFF);
-                var obj = world.Objects.OfType<DroppedItemObject>().FirstOrDefault(d => d.NetworkId == masked);
+                DroppedItemObject obj = null;
+                var droppedItems = world.DroppedItems;
+                for (int i = 0; i < droppedItems.Count; i++)
+                {
+                    var candidate = droppedItems[i];
+                    if (candidate != null && candidate.NetworkId == masked)
+                    {
+                        obj = candidate;
+                        break;
+                    }
+                }
                 obj?.ResetPickupState();
             });
         }
@@ -244,6 +361,205 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error parsing ItemRemoved packet.");
+            }
+            return Task.CompletedTask;
+        }
+
+        [PacketHandler(0x24, PacketRouter.NoSubCode)]  // ItemMoved / ItemMoveRequestFailed
+        public Task HandleItemMovedOrFailedAsync(Memory<byte> packet)
+        {
+            try
+            {
+                var span = packet.Span;
+                if (span.Length < 5)
+                {
+                    _logger.LogWarning("ItemMoved/Failed packet too short: {Length}", packet.Length);
+                    return Task.CompletedTask;
+                }
+
+                bool isFailed = span[0] == 0xC3 && span.Length >= 4 && span[3] == 0xFF;
+                if (isFailed)
+                {
+                    var failed = new ItemMoveRequestFailed(packet);
+                    var itemData = failed.ItemData.ToArray();
+                    // First, try restore inventory<->inventory failed move
+                    if (_characterState.TryConsumePendingInventoryMove(out var fromSlot, out _))
+                    {
+                        // Restore the item at original location
+                        _characterState.AddOrUpdateInventoryItem(fromSlot, itemData);
+                        _logger.LogWarning("Item move failed. Restored item at slot {From}", fromSlot);
+                        // Inform user
+                        MuGame.ScheduleOnMainThread(() =>
+                        {
+                            var gameScene = MuGame.Instance?.ActiveScene as Client.Main.Scenes.GameScene;
+                            gameScene?.ChatLog?.AddMessage("System", "Moving the item failed.", Client.Main.Models.MessageType.Error);
+                        });
+                    }
+                    // Then, try restore any pending storage move (vault <-> inventory)
+                    else if (_characterState.TryConsumePendingVaultMove(out var vFrom, out var vTo))
+                    {
+                        // If the move originated from vault -> inventory, vFrom represents the vault slot and vTo == 0xFF
+                        // Restore the item back into the vault at its original slot.
+                        _characterState.AddOrUpdateVaultItem(vFrom, itemData);
+                        _characterState.RaiseVaultItemsChanged();
+                        _logger.LogWarning("Storage move failed. Restored vault item at slot {From}", vFrom);
+
+                        // As a best-effort, also refresh inventory UI so any temporary visuals get reset.
+                        MuGame.ScheduleOnMainThread(() =>
+                        {
+                            _characterState.RaiseInventoryChanged();
+                            var gameScene = MuGame.Instance?.ActiveScene as Client.Main.Scenes.GameScene;
+                            gameScene?.ChatLog?.AddMessage("System", "Moving the item failed.", Client.Main.Models.MessageType.Error);
+                        });
+                    }
+                    // Chaos machine storage move failed
+                    else if (_characterState.TryConsumePendingChaosMachineMove(out var cFrom, out var cTo))
+                    {
+                        _characterState.AddOrUpdateChaosMachineItem(cFrom, itemData);
+                        _characterState.RaiseChaosMachineItemsChanged();
+                        _logger.LogWarning("Chaos machine move failed. Restored item at slot {From}", cFrom);
+
+                        MuGame.ScheduleOnMainThread(() =>
+                        {
+                            _characterState.RaiseInventoryChanged();
+                            var gameScene = MuGame.Instance?.ActiveScene as Client.Main.Scenes.GameScene;
+                            gameScene?.ChatLog?.AddMessage("System", "Moving the item failed.", Client.Main.Models.MessageType.Error);
+                        });
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Item move failed, but no pending move was stashed by client.");
+                        MuGame.ScheduleOnMainThread(() =>
+                        {
+                            var gameScene = MuGame.Instance?.ActiveScene as Client.Main.Scenes.GameScene;
+                            gameScene?.ChatLog?.AddMessage("System", "Moving the item failed.", Client.Main.Models.MessageType.Error);
+                        });
+                    }
+                }
+                else
+                {
+                    var moved = new ItemMoved(packet);
+                    var targetStore = moved.TargetStorageType;
+                    byte toSlot = moved.TargetSlot;
+                    var itemData = moved.ItemData.ToArray();
+
+                    if (targetStore == ItemStorageKind.Vault)
+                    {
+                        // Clear any pending storage move information
+                        if (_characterState.TryConsumePendingVaultMove(out var from, out var to))
+                        {
+                            if (from != to)
+                            {
+                                _characterState.RemoveVaultItem(from);
+                            }
+                        }
+                        // If the move originated from Inventory -> Vault, remove the source inventory slot now.
+                        if (_characterState.TryConsumePendingInventoryMove(out var invFrom, out var _))
+                        {
+                            _characterState.RemoveInventoryItem(invFrom);
+                        }
+
+                        _characterState.AddOrUpdateVaultItem(toSlot, itemData);
+                        _characterState.RaiseVaultItemsChanged();
+                        _logger.LogInformation("Vault item moved to slot {To}.", toSlot);
+                    }
+                    else if (targetStore == ItemStorageKind.ChaosMachine)
+                    {
+                        // Clear any pending chaos machine move information (for chaos->chaos moves)
+                        if (_characterState.TryConsumePendingChaosMachineMove(out var from, out var to))
+                        {
+                            if (from != to)
+                            {
+                                _characterState.RemoveChaosMachineItem(from);
+                            }
+                        }
+
+                        // If the move originated from Inventory -> ChaosMachine, remove the source inventory slot now.
+                        if (_characterState.TryConsumePendingInventoryMove(out var invFrom, out var _))
+                        {
+                            _characterState.RemoveInventoryItem(invFrom);
+                        }
+
+                        _characterState.AddOrUpdateChaosMachineItem(toSlot, itemData);
+                        _characterState.RaiseChaosMachineItemsChanged();
+                        _logger.LogInformation("Chaos machine item moved to slot {To}.", toSlot);
+                    }
+                    else // Inventory or others -> inventory fallback
+                    {
+                        // If we had a pending vault->inventory move, remove from vault
+                        if (_characterState.TryConsumePendingVaultMove(out var vf, out var vt))
+                        {
+                            _characterState.RemoveVaultItem(vf);
+                            _characterState.RaiseVaultItemsChanged();
+                        }
+                        // If we had a pending chaos machine->inventory move, remove from chaos machine
+                        if (_characterState.TryConsumePendingChaosMachineMove(out var cf, out var ct))
+                        {
+                            _characterState.RemoveChaosMachineItem(cf);
+                            _characterState.RaiseChaosMachineItemsChanged();
+                        }
+                        if (_characterState.TryConsumePendingInventoryMove(out var fromSlot, out var pendingTo))
+                        {
+                            if (fromSlot != toSlot)
+                            {
+                                _characterState.RemoveInventoryItem(fromSlot);
+                            }
+                            _characterState.AddOrUpdateInventoryItem(toSlot, itemData);
+                            _logger.LogInformation("Item moved: {From} -> {To}", fromSlot, toSlot);
+                        }
+                        else
+                        {
+                            // No pending move stashed; best effort update
+                            _characterState.AddOrUpdateInventoryItem(toSlot, itemData);
+                            _logger.LogInformation("Item moved to slot {To}, no pending move available.", toSlot);
+                        }
+
+                        // Ensure inventory UI refreshes (e.g. when moving items from vault/chaos machine into inventory).
+                        _characterState.RaiseInventoryChanged();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error parsing ItemMoved/Failed (0x24) packet.");
+            }
+            return Task.CompletedTask;
+        }
+
+        [PacketHandler(0x23, PacketRouter.NoSubCode)]  // DropItemRequest result (ack)
+        public Task HandleDropItemAckAsync(Memory<byte> packet)
+        {
+            try
+            {
+                var span = packet.Span;
+                if (span.Length < 5 || span[0] != 0xC1 || span[2] != 0x23)
+                {
+                    _logger.LogWarning("Unexpected DropItem ack format. Data: {Data}", Convert.ToHexString(span));
+                    return Task.CompletedTask;
+                }
+
+                bool success = span[3] != 0;
+                byte slot = span[4];
+                if (success)
+                {
+                    _characterState.RemoveInventoryItem(slot);
+                    _logger.LogInformation("DropItem ACK: Removed slot {Slot} from inventory.", slot);
+                }
+                else
+                {
+                    _logger.LogWarning("DropItem ACK: Server reported failure for slot {Slot}", slot);
+                    // Force refresh to re-show the item and inform user
+                    MuGame.ScheduleOnMainThread(() =>
+                    {
+                        _characterState.RaiseInventoryChanged();
+                        var gameScene = MuGame.Instance?.ActiveScene as Client.Main.Scenes.GameScene;
+                        gameScene?.ChatLog?.AddMessage("System", "Dropping the item failed.", Client.Main.Models.MessageType.Error);
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error parsing DropItem ack (0x23).");
             }
             return Task.CompletedTask;
         }
@@ -306,6 +622,56 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             return Task.CompletedTask;
         }
 
+        [PacketHandler(0xF3, 0x14)]  // InventoryItemUpgraded
+        public Task HandleInventoryItemUpgradedAsync(Memory<byte> packet)
+        {
+            try
+            {
+                if (packet.Length < 6)
+                {
+                    _logger.LogWarning("InventoryItemUpgraded packet too short: {Length}", packet.Length);
+                    return Task.CompletedTask;
+                }
+
+                if (_targetVersion >= TargetProtocolVersion.Season6)
+                {
+                    byte slot = packet.Span[4];
+                    int itemDataOffset = 5;
+                    if (packet.Length <= itemDataOffset)
+                    {
+                        _logger.LogWarning("InventoryItemUpgraded packet missing item data: {Length}", packet.Length);
+                        return Task.CompletedTask;
+                    }
+
+                    ReadOnlySpan<byte> itemSpan = packet.Span.Slice(itemDataOffset);
+                    int itemLen;
+                    if (!ItemDataParser.TryGetExtendedItemLength(itemSpan, out itemLen) || itemDataOffset + itemLen > packet.Length)
+                    {
+                        itemLen = Math.Min(itemSpan.Length, 12);
+                    }
+
+                    var data = itemSpan.Slice(0, itemLen).ToArray();
+                    _characterState.AddOrUpdateInventoryItem(slot, data);
+                    string itemName = ItemDatabase.GetItemName(data) ?? "Unknown Item";
+                    _logger.LogInformation("Item upgraded in slot {Slot}: {ItemName}", slot, itemName);
+                }
+                else
+                {
+                    var upgraded = new InventoryItemUpgraded(packet);
+                    var data = upgraded.ItemData.ToArray();
+                    _characterState.AddOrUpdateInventoryItem(upgraded.InventorySlot, data);
+                    string itemName = ItemDatabase.GetItemName(data) ?? "Unknown Item";
+                    _logger.LogInformation("Item upgraded in slot {Slot}: {ItemName}", upgraded.InventorySlot, itemName);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error parsing InventoryItemUpgraded packet.");
+            }
+
+            return Task.CompletedTask;
+        }
+
         // ────────────────────────── Helpers ────────────────────────────
 
         /// <summary>
@@ -319,10 +685,14 @@ namespace Client.Main.Networking.PacketHandling.Handlers
             switch (_targetVersion)
             {
                 case TargetProtocolVersion.Season6:
-                    var invS6 = new CharacterInventoryRef(span.ToArray());
-                    count = invS6.ItemCount;
+                    if (span.Length < 6)
+                    {
+                        _logger.LogWarning("Inventory packet too short for S6 header: {Length}", span.Length);
+                        return;
+                    }
+
+                    count = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(4, 2));
                     offset = 6;
-                    dataSize = 12;
                     _logger.LogInformation("Updating inventory (S6): {Count} items.", count);
                     break;
 
@@ -357,20 +727,66 @@ namespace Client.Main.Networking.PacketHandling.Handlers
 
             int slotSize = 1 + dataSize;
             int pos = offset;
-            for (int i = 0; i < count; i++, pos += slotSize)
+            if (_targetVersion == TargetProtocolVersion.Season6)
             {
-                if (pos + slotSize > span.Length)
+                int remaining = span.Length - offset;
+                bool fixedLength = count > 0 && remaining == count * (1 + 12);
+                dataSize = fixedLength ? 12 : 0;
+
+                for (int i = 0; i < count; i++)
                 {
-                    _logger.LogWarning("Inventory packet too short parsing item {Index}.", i);
-                    break;
+                    if (pos + 1 > span.Length)
+                    {
+                        _logger.LogWarning("Inventory packet too short parsing item {Index}.", i);
+                        break;
+                    }
+
+                    byte slot = span[pos];
+                    pos += 1;
+
+                    ReadOnlySpan<byte> itemSpan = span.Slice(pos);
+                    int length = dataSize;
+                    if (!fixedLength)
+                    {
+                        if (!ItemDataParser.TryGetExtendedItemLength(itemSpan, out length) || pos + length > span.Length)
+                        {
+                            _logger.LogWarning("Inventory item {Index} has invalid extended data length.", i);
+                            break;
+                        }
+                    }
+
+                    if (pos + length > span.Length)
+                    {
+                        _logger.LogWarning("Inventory packet too short parsing item {Index}.", i);
+                        break;
+                    }
+
+                    var itemData = span.Slice(pos, length).ToArray();
+                    pos += length;
+
+                    _characterState.AddOrUpdateInventoryItem(slot, itemData);
+
+                    string name = ItemDatabase.GetItemName(itemData) ?? "Unknown Item";
+                    _logger.LogDebug("Slot {Slot}: {Name} (DataLen: {Len})", slot, name, length);
                 }
+            }
+            else
+            {
+                for (int i = 0; i < count; i++, pos += slotSize)
+                {
+                    if (pos + slotSize > span.Length)
+                    {
+                        _logger.LogWarning("Inventory packet too short parsing item {Index}.", i);
+                        break;
+                    }
 
-                byte slot = span[pos];
-                var itemData = span.Slice(pos + 1, dataSize).ToArray();
-                _characterState.AddOrUpdateInventoryItem(slot, itemData);
+                    byte slot = span[pos];
+                    var itemData = span.Slice(pos + 1, dataSize).ToArray();
+                    _characterState.AddOrUpdateInventoryItem(slot, itemData);
 
-                string name = ItemDatabase.GetItemName(itemData) ?? "Unknown Item";
-                _logger.LogDebug("Slot {Slot}: {Name} (DataLen: {Len})", slot, name, dataSize);
+                    string name = ItemDatabase.GetItemName(itemData) ?? "Unknown Item";
+                    _logger.LogDebug("Slot {Slot}: {Name} (DataLen: {Len})", slot, name, dataSize);
+                }
             }
         }
     }

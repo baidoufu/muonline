@@ -42,7 +42,6 @@ namespace Client.Main.Objects.Effects
             _scale0 = (float)(_rng.NextDouble() * 1.2 + 1.0);
             Scale = _scale0;
         }
-
         public override void Update(GameTime gameTime)
         {
             base.Update(gameTime);

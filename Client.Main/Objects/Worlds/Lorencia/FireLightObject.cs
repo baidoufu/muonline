@@ -1,6 +1,7 @@
 ﻿using Client.Data;
 using Client.Main.Content;
 using Client.Main.Controls;
+using Client.Main.Models;
 using Client.Main.Objects.Effects;
 using Microsoft.Extensions.Logging;
 using Microsoft.Xna.Framework;
@@ -62,8 +63,8 @@ namespace Client.Main.Objects.Worlds.Lorencia
             {
                 Owner = this,
                 Color = new Vector3(1f, 0.7f, 0.4f),
-                Radius = 250f,
-                Intensity = 1f,
+                Radius = 400f,
+                Intensity = 1.5f,
                 Position = Vector3.Zero
             };
 
@@ -125,7 +126,10 @@ namespace Client.Main.Objects.Worlds.Lorencia
                 UpdateIndividualWindEffects(time, elapsed);
                 float baseLuminosity = CalculateBaseLuminosity(time);
 
-                if (WorldPosition.Down.Y != -1)
+                // Use stable position based on object rotation (avoid float comparison instability)
+                // Check if object is rotated (Down.Y close to -1 means upright)
+                bool isRotated = WorldPosition.Down.Y > -0.9f;
+                if (isRotated)
                     _basePosition = BoneTransform[1].Translation + new Vector3(40f, 30f, 0f);
                 else
                     _basePosition = BoneTransform[1].Translation + new Vector3(0f, 0f, 0f);
@@ -146,8 +150,16 @@ namespace Client.Main.Objects.Worlds.Lorencia
         private void UpdateDynamicLight(float intensity)
         {
             if (World?.Terrain == null) return;
-            _dynamicLight.Position = WorldPosition.Translation + _basePosition + new Vector3(0f, OFFSET_Y, _baseHeight);
+
+            _dynamicLight.Position = GetLightAnchorWorld();
             _dynamicLight.Intensity = intensity;
+        }
+
+        private Vector3 GetLightAnchorWorld()
+        {
+            // Match flame position calculation - use translation + offset (not full matrix transform)
+            // This ensures light stays aligned with flame textures regardless of object rotation
+            return WorldPosition.Translation + _basePosition + new Vector3(0f, OFFSET_Y, _baseHeight + MIDDLE_FLAME_ADDITIONAL_Z);
         }
 
         private void UpdateIndividualWindEffects(float time, float elapsed)

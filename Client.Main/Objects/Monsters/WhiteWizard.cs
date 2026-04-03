@@ -7,15 +7,17 @@ using System.Threading.Tasks;
 
 namespace Client.Main.Objects.Monsters
 {
+    [NpcInfo(135, "White Wizard")]
     public class WhiteWizard : MonsterObject
     {
         public WhiteWizard()
         {
+            Scale = 1.7f;
         }
 
         public override async Task Load()
         {
-            Model = await BMDLoader.Instance.Prepare($"Monster/Monster73.bmd");
+            Model = await BMDLoader.Instance.Prepare($"Monster/Monster48.bmd");
             await base.Load();
         }
     }

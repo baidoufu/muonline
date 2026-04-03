@@ -1,6 +1,7 @@
 ﻿using Client.Main.Content;
 using Client.Main.Controls;
 using Client.Main.Objects.Effects;
+using Client.Main.Models;
 using Microsoft.Xna.Framework;
 using System;
 using System.Collections.Generic;
@@ -24,14 +25,14 @@ namespace Client.Main.Objects.Worlds.Lorencia
             public DynamicLight Light { get; } = new DynamicLight
             {
                 Color = new Vector3(1f, 0.7f, 0.4f),
-                Radius = 400f,
+                Radius = 260f,
                 Intensity = 1f
             };
         }
 
         private FlameSet _firstFlameSet;
         private FlameSet _secondFlameSet;
-        private float _baseHeight = 40f;
+        private float _baseHeight = 28f;
         private static readonly Random _random = new Random();
 
         // Constants
@@ -130,8 +131,16 @@ namespace Client.Main.Objects.Worlds.Lorencia
 
         private void UpdateDynamicLight(FlameSet set, float intensity)
         {
-            set.Light.Position = WorldPosition.Translation + set.BasePosition + new Vector3(0f, -5f, _baseHeight);
+            set.Light.Position = GetLightAnchorWorld(set);
             set.Light.Intensity = intensity;
+        }
+
+        private Vector3 GetLightAnchorWorld(FlameSet set)
+        {
+            // Keep light anchored near the flame base to avoid penetrating surrounding geometry.
+            // BasePosition is in model space (relative to the bridge), so transform to world.
+            Vector3 localAnchor = set.BasePosition + new Vector3(0f, -5f, _baseHeight + 30f);
+            return Vector3.Transform(localAnchor, WorldPosition);
         }
 
         private void UpdateIndividualWindEffects(FlameSet flameSet, float time)

@@ -4,8 +4,11 @@ using NLayer;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Xna.Framework;
 using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 
 namespace Client.Main.Controllers
 {
@@ -16,12 +19,45 @@ namespace Client.Main.Controllers
         private Dictionary<string, SoundEffect> _soundEffectCache = new Dictionary<string, SoundEffect>();
         private SoundEffectInstance _activeBackgroundMusicInstance;
         private string _currentBackgroundMusicPath;
+        private SoundEffectInstance _activeAmbientSoundInstance;
+        private string _currentAmbientSoundPath;
         private HashSet<string> _failedPaths = new HashSet<string>();
+        private readonly Dictionary<string, Task<SoundEffect>> _soundEffectLoadTasks = new Dictionary<string, Task<SoundEffect>>(StringComparer.OrdinalIgnoreCase);
+        private readonly object _soundCacheLock = new object();
+        private int _backgroundMusicRequestId;
 
-        private readonly Dictionary<string, SoundEffectInstance> _managedLoopingInstances = new Dictionary<string, SoundEffectInstance>();
+        private sealed class ManagedLoopData
+        {
+            public SoundEffectInstance Instance;
+            public float BaseVolume;
+        }
+
+        private sealed class RecentPlayInfo
+        {
+            public double LastTimeMs;
+            public float LastVolume;
+        }
+
+        private readonly Dictionary<string, ManagedLoopData> _managedLoopingInstances = new Dictionary<string, ManagedLoopData>();
         private ILogger _logger = MuGame.AppLoggerFactory?.CreateLogger<SoundController>();
+        private readonly Stopwatch _playStopwatch = Stopwatch.StartNew();
+        private readonly Dictionary<string, RecentPlayInfo> _recentOneShots = new Dictionary<string, RecentPlayInfo>(StringComparer.OrdinalIgnoreCase);
+        private readonly object _recentOneShotsLock = new object();
+        private const double OneShotMinIntervalMs = 120.0; // prevent identical bursts stacking on the same frame
+        private const float OneShotVolumeSlack = 0.05f;   // allow slightly louder instances to break through the throttle
+
+        private SoundController()
+        {
+            SoundEffect.MasterVolume = MathHelper.Clamp(Constants.SOUND_EFFECTS_VOLUME / 100f, 0f, 1f);
+        }
 
         public void StopBackgroundMusic()
+        {
+            Interlocked.Increment(ref _backgroundMusicRequestId);
+            StopBackgroundMusicInstance();
+        }
+
+        private void StopBackgroundMusicInstance()
         {
             _activeBackgroundMusicInstance?.Stop(true);
             _activeBackgroundMusicInstance?.Dispose();
@@ -45,30 +81,10 @@ namespace Client.Main.Controllers
                 return;
             }
 
-            StopBackgroundMusic();
+            var requestId = Interlocked.Increment(ref _backgroundMusicRequestId);
+            StopBackgroundMusicInstance();
 
-            SoundEffect musicEffect = LoadSoundEffectData(Path.Combine(Constants.DataPath, relativePath));
-            if (musicEffect != null)
-            {
-                _activeBackgroundMusicInstance = musicEffect.CreateInstance();
-                _activeBackgroundMusicInstance.IsLooped = true;
-                try
-                {
-                    _activeBackgroundMusicInstance.Play();
-                    _currentBackgroundMusicPath = relativePath;
-                }
-                catch (Exception ex)
-                {
-                    _logger?.LogDebug($"[PlayBackgroundMusic] Error playing sound '{relativePath}': {ex.Message}");
-                    _activeBackgroundMusicInstance.Dispose();
-                    _activeBackgroundMusicInstance = null;
-                    _currentBackgroundMusicPath = null;
-                }
-            }
-            else
-            {
-                _logger?.LogDebug($"[PlayBackgroundMusic] Failed to load SoundEffect for: {relativePath}");
-            }
+            _ = PlayBackgroundMusicAsync(relativePath, requestId);
         }
 
         public void PreloadBackgroundMusic(string relativePath)
@@ -76,7 +92,58 @@ namespace Client.Main.Controllers
             if ((!Constants.BACKGROUND_MUSIC && !Constants.SOUND_EFFECTS) || string.IsNullOrEmpty(relativePath))
                 return;
 
-            LoadSoundEffectData(Path.Combine(Constants.DataPath, relativePath));
+            _ = LoadSoundEffectDataAsync(Path.Combine(Constants.DataPath, relativePath));
+        }
+
+        public void StopAmbientSound()
+        {
+            _activeAmbientSoundInstance?.Stop(true);
+            _activeAmbientSoundInstance?.Dispose();
+            _activeAmbientSoundInstance = null;
+            _currentAmbientSoundPath = null;
+        }
+
+        public void PlayAmbientSound(string relativePath)
+        {
+            if (!Constants.SOUND_EFFECTS || string.IsNullOrEmpty(relativePath))
+            {
+                StopAmbientSound();
+                return;
+            }
+
+            if (_currentAmbientSoundPath == relativePath &&
+                _activeAmbientSoundInstance != null &&
+                !_activeAmbientSoundInstance.IsDisposed &&
+                _activeAmbientSoundInstance.State == SoundState.Playing)
+            {
+                return;
+            }
+
+            StopAmbientSound();
+
+            SoundEffect ambientEffect = LoadSoundEffectData(Path.Combine(Constants.DataPath, relativePath));
+            if (ambientEffect != null)
+            {
+                _activeAmbientSoundInstance = ambientEffect.CreateInstance();
+                _activeAmbientSoundInstance.IsLooped = true;
+                _activeAmbientSoundInstance.Volume = 1f; // Lower volume for ambient sounds
+                try
+                {
+                    _activeAmbientSoundInstance.Play();
+                    _currentAmbientSoundPath = relativePath;
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogDebug($"[PlayAmbientSound] Error playing sound '{relativePath}': {ex.Message}");
+                    _activeAmbientSoundInstance.Dispose();
+                    _activeAmbientSoundInstance = null;
+                    _currentAmbientSoundPath = null;
+                }
+            }
+            else
+            {
+                _logger?.LogDebug($"[PlayAmbientSound] Failed to load SoundEffect for: {relativePath}");
+            }
         }
 
         /// <summary>
@@ -103,13 +170,12 @@ namespace Client.Main.Controllers
             float distance = Vector3.Distance(sourcePosition, listenerPosition);
             float volume = 1.0f - (distance / maxDistance);
             volume = MathHelper.Clamp(volume, 0f, 1f);
+            float fxFactor = Constants.SOUND_EFFECTS_VOLUME / 100f;
 
             if (loop)
             {
                 string instanceKey = fullPath.ToLowerInvariant();
-                SoundEffectInstance instance;
-
-                if (!_managedLoopingInstances.TryGetValue(instanceKey, out instance) || instance == null || instance.IsDisposed)
+                if (!_managedLoopingInstances.TryGetValue(instanceKey, out var managed) || managed.Instance == null || managed.Instance.IsDisposed)
                 {
                     SoundEffect sfxData = LoadSoundEffectData(fullPath);
                     if (sfxData == null || sfxData.IsDisposed)
@@ -117,14 +183,22 @@ namespace Client.Main.Controllers
                         _logger?.LogDebug($"[ManagedLoop] Failed to load SoundEffect data for: {relativePath}");
                         return;
                     }
-                    instance = sfxData.CreateInstance();
-                    instance.IsLooped = true;
-                    _managedLoopingInstances[instanceKey] = instance;
+
+                    var newInstance = sfxData.CreateInstance();
+                    newInstance.IsLooped = true;
+                    managed = new ManagedLoopData
+                    {
+                        Instance = newInstance,
+                        BaseVolume = 0f
+                    };
+                    _managedLoopingInstances[instanceKey] = managed;
                 }
 
-                instance.Volume = volume;
+                var instance = managed.Instance;
+                managed.BaseVolume = MathHelper.Clamp(volume, 0f, 1f);
+                UpdateManagedLoopVolume(managed);
 
-                if (volume > 0.01f)
+                if (managed.BaseVolume > 0.01f)
                 {
                     if (instance.State != SoundState.Playing)
                     {
@@ -135,37 +209,46 @@ namespace Client.Main.Controllers
                         catch (Exception ex)
                         {
                             _logger?.LogDebug($"[ManagedLoop] Error playing instance of '{relativePath}': {ex.Message}");
-                            instance.Dispose(); // Usuń uszkodzoną instancję
+                            instance.Dispose();
                             _managedLoopingInstances.Remove(instanceKey);
                         }
                     }
-                }
-                else
-                {
-                    if (instance.State == SoundState.Playing)
+                    else
                     {
-                        instance.Pause();
+                        UpdateManagedLoopVolume(managed);
                     }
+                }
+                else if (instance.State == SoundState.Playing)
+                {
+                    instance.Pause();
                 }
             }
             else
             {
+                float scaledVolume = MathHelper.Clamp(volume * fxFactor, 0f, 1f);
+                if (scaledVolume <= 0.01f || fxFactor <= 0f)
+                {
+                    return;
+                }
+
+                if (ShouldThrottleOneShot(fullPath, scaledVolume))
+                {
+                    return;
+                }
+
                 SoundEffect sfx = LoadSoundEffectData(fullPath); // LoadSoundEffectData używa cache
                 if (sfx == null || sfx.IsDisposed)
                 {
                     return;
                 }
 
-                if (volume > 0.01f)
+                try
                 {
-                    try
-                    {
-                        sfx.Play(volume, 0.0f, 0.0f);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger?.LogDebug($"[PlayEffectWithAttenuation] Error playing sound '{relativePath}': {ex.Message}");
-                    }
+                    sfx.Play(scaledVolume, 0.0f, 0.0f);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogDebug($"[PlayEffectWithAttenuation] Error playing sound '{relativePath}': {ex.Message}");
                 }
             }
         }
@@ -180,7 +263,12 @@ namespace Client.Main.Controllers
 
             try
             {
-                sfx.Play();
+                var volume = MathHelper.Clamp(Constants.SOUND_EFFECTS_VOLUME / 100f, 0f, 1f);
+                if (volume <= 0f)
+                {
+                    return;
+                }
+                sfx.Play(volume, 0.0f, 0.0f);
             }
             catch (Exception ex)
             {
@@ -188,23 +276,95 @@ namespace Client.Main.Controllers
             }
         }
 
+        public void ApplyBackgroundMusicVolume()
+        {
+            if (_activeBackgroundMusicInstance != null && !_activeBackgroundMusicInstance.IsDisposed)
+            {
+                var rawVolume = Constants.BACKGROUND_MUSIC_VOLUME / 100f;
+                if (rawVolume <= 0f)
+                {
+                    StopBackgroundMusic();
+                    return;
+                }
+
+                var volume = MathHelper.Clamp(rawVolume, 0f, 1f);
+
+                if (float.IsNaN(volume) || float.IsInfinity(volume))
+                {
+                    volume = 1f;
+                }
+
+                volume = Math.Max(0f, Math.Min(1f, volume));
+
+                _activeBackgroundMusicInstance.Volume = volume;
+            }
+        }
+
+        public void ApplySoundEffectsVolume()
+        {
+            float master = Constants.SOUND_EFFECTS ? MathHelper.Clamp(Constants.SOUND_EFFECTS_VOLUME / 100f, 0f, 1f) : 0f;
+            SoundEffect.MasterVolume = master;
+            foreach (var entry in _managedLoopingInstances.Values)
+            {
+                UpdateManagedLoopVolume(entry);
+            }
+        }
+
+        private void UpdateManagedLoopVolume(ManagedLoopData managed)
+        {
+            if (managed?.Instance == null || managed.Instance.IsDisposed)
+            {
+                return;
+            }
+
+            if (!Constants.SOUND_EFFECTS)
+            {
+                managed.Instance.Volume = 0f;
+                if (managed.Instance.State == SoundState.Playing)
+                {
+                    managed.Instance.Pause();
+                }
+                return;
+            }
+
+            float factor = Constants.SOUND_EFFECTS_VOLUME / 100f;
+            var calculatedVolume = managed.BaseVolume * factor;
+            managed.Instance.Volume = MathHelper.Clamp(calculatedVolume, 0f, 1f);
+            if (managed.Instance.Volume <= 0f)
+            {
+                if (managed.Instance.State == SoundState.Playing)
+                {
+                    managed.Instance.Pause();
+                }
+            }
+            else if (managed.Instance.State != SoundState.Playing)
+            {
+                try
+                {
+                    managed.Instance.Play();
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogDebug($"[ManagedLoop] Error resuming loop instance: {ex.Message}");
+                }
+            }
+        }
+
         private SoundEffect LoadSoundEffectData(string fullPath)
         {
             string cacheKey = fullPath.ToLowerInvariant();
-            if (_soundEffectCache.TryGetValue(cacheKey, out SoundEffect sfx))
+            var cached = GetCachedSoundEffect(cacheKey);
+            if (cached != null)
             {
-                if (sfx != null && !sfx.IsDisposed)
-                    return sfx;
-                else
-                    _soundEffectCache.Remove(cacheKey);
+                return cached;
             }
 
-            if (_failedPaths.Contains(cacheKey)) return null;
+            if (IsFailedPath(cacheKey)) return null;
 
             if (!File.Exists(fullPath))
             {
                 _logger?.LogDebug($"[LoadSoundEffectData] File not found: {fullPath}");
-                _failedPaths.Add(cacheKey);
+                MarkFailedPath(cacheKey);
                 return null;
             }
 
@@ -226,26 +386,26 @@ namespace Client.Main.Controllers
                     else
                     {
                         _logger?.LogDebug($"[LoadSoundEffectData] Failed to load PCM data from MP3: {fullPath}");
-                        _failedPaths.Add(cacheKey);
+                        MarkFailedPath(cacheKey);
                     }
                 }
                 else
                 {
                     _logger?.LogDebug($"[LoadSoundEffectData] Unsupported audio file extension: {extension} for path {fullPath}");
-                    _failedPaths.Add(cacheKey);
+                    MarkFailedPath(cacheKey);
                     return null;
                 }
 
                 if (loadedSfx != null)
                 {
-                    _soundEffectCache[cacheKey] = loadedSfx;
+                    CacheSoundEffect(cacheKey, loadedSfx);
                 }
                 return loadedSfx;
             }
             catch (Exception ex)
             {
                 _logger?.LogDebug($"[LoadSoundEffectData] Error loading sound data from '{fullPath}': {ex.Message}");
-                _failedPaths.Add(cacheKey);
+                MarkFailedPath(cacheKey);
             }
             return null;
         }
@@ -311,26 +471,195 @@ namespace Client.Main.Controllers
         {
             StopBackgroundMusic();
 
-            foreach (var sfx in _soundEffectCache.Values)
+            List<SoundEffect> cached;
+            lock (_soundCacheLock)
+            {
+                cached = new List<SoundEffect>(_soundEffectCache.Values);
+                _soundEffectCache.Clear();
+                _soundEffectLoadTasks.Clear();
+                _failedPaths.Clear();
+            }
+
+            foreach (var sfx in cached)
             {
                 sfx?.Dispose();
             }
-            _soundEffectCache.Clear();
 
             foreach (var instanceEntry in _managedLoopingInstances)
             {
-                instanceEntry.Value?.Stop(true);
-                instanceEntry.Value?.Dispose();
+                var managed = instanceEntry.Value;
+                if (managed?.Instance != null)
+                {
+                    managed.Instance.Stop(true);
+                    managed.Instance.Dispose();
+                    managed.Instance = null;
+                }
             }
             _managedLoopingInstances.Clear();
 
-            _failedPaths.Clear();
             _logger?.LogDebug("SoundController: SoundEffect cache and managed looping instances cleared.");
         }
 
         public void Dispose()
         {
             ClearSoundCaches();
+        }
+
+        private async Task PlayBackgroundMusicAsync(string relativePath, int requestId)
+        {
+            SoundEffect musicEffect = null;
+            var fullPath = Path.Combine(Constants.DataPath, relativePath);
+            try
+            {
+                musicEffect = await LoadSoundEffectDataAsync(fullPath).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogDebug($"[PlayBackgroundMusic] Error loading sound '{relativePath}': {ex.Message}");
+            }
+
+            if (musicEffect == null)
+            {
+                _logger?.LogDebug($"[PlayBackgroundMusic] Failed to load SoundEffect for: {relativePath}");
+                return;
+            }
+
+            MuGame.ScheduleOnMainThread(() =>
+            {
+                if (requestId != _backgroundMusicRequestId || !Constants.BACKGROUND_MUSIC)
+                {
+                    return;
+                }
+
+                _activeBackgroundMusicInstance?.Stop(true);
+                _activeBackgroundMusicInstance?.Dispose();
+                _activeBackgroundMusicInstance = musicEffect.CreateInstance();
+                _activeBackgroundMusicInstance.IsLooped = true;
+                try
+                {
+                    ApplyBackgroundMusicVolume();
+                    _activeBackgroundMusicInstance.Play();
+                    _currentBackgroundMusicPath = relativePath;
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogDebug($"[PlayBackgroundMusic] Error playing sound '{relativePath}': {ex.Message}");
+                    StopBackgroundMusicInstance();
+                }
+            });
+        }
+
+        private Task<SoundEffect> LoadSoundEffectDataAsync(string fullPath)
+        {
+            string cacheKey = fullPath.ToLowerInvariant();
+
+            var cached = GetCachedSoundEffect(cacheKey);
+            if (cached != null)
+            {
+                return Task.FromResult(cached);
+            }
+
+            if (IsFailedPath(cacheKey))
+            {
+                return Task.FromResult<SoundEffect>(null);
+            }
+
+            lock (_soundCacheLock)
+            {
+                if (_soundEffectLoadTasks.TryGetValue(cacheKey, out var existingTask))
+                {
+                    return existingTask;
+                }
+
+                var task = Task.Run(() =>
+                {
+                    try
+                    {
+                        return LoadSoundEffectData(fullPath);
+                    }
+                    finally
+                    {
+                        lock (_soundCacheLock)
+                        {
+                            _soundEffectLoadTasks.Remove(cacheKey);
+                        }
+                    }
+                });
+
+                _soundEffectLoadTasks[cacheKey] = task;
+                return task;
+            }
+        }
+
+        private SoundEffect GetCachedSoundEffect(string cacheKey)
+        {
+            lock (_soundCacheLock)
+            {
+                if (_soundEffectCache.TryGetValue(cacheKey, out var sfx))
+                {
+                    if (sfx != null && !sfx.IsDisposed)
+                    {
+                        return sfx;
+                    }
+                    _soundEffectCache.Remove(cacheKey);
+                }
+            }
+
+            return null;
+        }
+
+        private void CacheSoundEffect(string cacheKey, SoundEffect effect)
+        {
+            lock (_soundCacheLock)
+            {
+                _soundEffectCache[cacheKey] = effect;
+            }
+        }
+
+        private bool IsFailedPath(string cacheKey)
+        {
+            lock (_soundCacheLock)
+            {
+                return _failedPaths.Contains(cacheKey);
+            }
+        }
+
+        private void MarkFailedPath(string cacheKey)
+        {
+            lock (_soundCacheLock)
+            {
+                _failedPaths.Add(cacheKey);
+            }
+        }
+
+        private bool ShouldThrottleOneShot(string cacheKey, float finalVolume)
+        {
+            var nowMs = _playStopwatch.Elapsed.TotalMilliseconds;
+            lock (_recentOneShotsLock)
+            {
+                if (_recentOneShots.TryGetValue(cacheKey, out var info))
+                {
+                    var elapsed = nowMs - info.LastTimeMs;
+                    bool isQuieterOrEqual = finalVolume <= info.LastVolume + OneShotVolumeSlack;
+                    if (elapsed < OneShotMinIntervalMs && isQuieterOrEqual)
+                    {
+                        return true;
+                    }
+
+                    info.LastTimeMs = nowMs;
+                    info.LastVolume = Math.Max(finalVolume, info.LastVolume);
+                }
+                else
+                {
+                    _recentOneShots[cacheKey] = new RecentPlayInfo
+                    {
+                        LastTimeMs = nowMs,
+                        LastVolume = finalVolume
+                    };
+                }
+            }
+
+            return false;
         }
     }
 }

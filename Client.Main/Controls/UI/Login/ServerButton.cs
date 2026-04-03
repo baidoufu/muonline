@@ -1,8 +1,9 @@
+using Client.Main.Graphics;
+using Client.Main.Models;
 using Microsoft.Xna.Framework.Input;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using System.Net.NetworkInformation;
-using Client.Main.Models;
 
 namespace Client.Main.Controls.UI.Login
 {
@@ -51,6 +52,7 @@ namespace Client.Main.Controls.UI.Login
 
             Interactive = Available;
             _status.TileWidth = 167 * Gauge;
+            _status.Visible = Gauge > 0;
 
             if (!Available)
                 TileY = 2;

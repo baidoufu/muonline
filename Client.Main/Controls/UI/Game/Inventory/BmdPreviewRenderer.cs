@@ -2,8 +2,11 @@ using System;
 using System.Collections.Generic;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
+using Client.Main;
 using Client.Main.Content;
 using Client.Main.Controllers;
+using Client.Main.Graphics;
+using Client.Main.Models;
 using System.Reflection;
 
 namespace Client.Main.Controls.UI.Game.Inventory
@@ -13,83 +16,198 @@ namespace Client.Main.Controls.UI.Game.Inventory
     /// </summary>
     public static class BmdPreviewRenderer
     {
-        private static readonly Dictionary<string, Texture2D> _cache = new();
-        private static readonly Dictionary<string, Texture2D> _rotatingCache = new();
+        private readonly struct ItemRenderProperties
+        {
+            public static ItemRenderProperties Default => new(0, false, false);
+
+            public ItemRenderProperties(int level, bool isExcellent, bool isAncient)
+            {
+                Level = Math.Clamp(level, 0, 15);
+                IsExcellent = isExcellent;
+                IsAncient = isAncient;
+            }
+
+            public int Level { get; }
+            public bool IsExcellent { get; }
+            public bool IsAncient { get; }
+
+            public bool RequiresDistinctKey => Level != 0 || IsExcellent || IsAncient;
+            public bool ShouldUseItemMaterial => Level >= 7 || IsExcellent || IsAncient;
+            public int ItemOptions => (Level & 0x0F) | (IsExcellent ? 0x10 : 0);
+        }
+
+        private sealed class PreviewCacheEntry : IDisposable
+        {
+            public PreviewCacheEntry(RenderTarget2D texture, float lastUpdateTime, bool requiresAnimation)
+            {
+                Texture = texture;
+                LastUpdateTime = lastUpdateTime;
+                RequiresAnimation = requiresAnimation;
+            }
+
+            public RenderTarget2D Texture { get; private set; }
+            public float LastUpdateTime { get; set; }
+            public bool RequiresAnimation { get; set; }
+
+            public void UpdateTexture(RenderTarget2D texture)
+            {
+                if (ReferenceEquals(Texture, texture))
+                {
+                    return;
+                }
+
+                Texture?.Dispose();
+                Texture = texture;
+            }
+
+            public void Dispose()
+            {
+                Texture?.Dispose();
+                Texture = null;
+            }
+        }
+
+        private static readonly Dictionary<string, PreviewCacheEntry> _cache = new();
+        private static readonly Dictionary<string, PreviewCacheEntry> _rotatingCache = new();
+        private static readonly Queue<string> _rotatingCacheKeys = new();
         private static readonly HashSet<string> _failedRenders = new();
         private static readonly Dictionary<string, BlendState> _previewBlendStateCache = new();
 
-        // Rotating cache cleanup
-        private static int _rotatingCacheCleanupCounter = 0;
-        private const int MaxRotatingCacheSize = 50;
+        // Reusable buffer to avoid per-frame allocations in GetPreviewInternal
+        private static readonly Vector3[] _transformedCornersBuffer = new Vector3[8];
+
+        private const int MaxRotatingCacheSize = 96;
+        private const float AnimatedUpdateInterval = 1f / 23f; // limit
+
+        private static ItemRenderProperties CreateRenderProperties(InventoryItem item)
+        {
+            if (item == null)
+            {
+                return ItemRenderProperties.Default;
+            }
+
+            var details = item.Details;
+            int level = Math.Max(details.Level, item.Level);
+            bool isExcellent = details.IsExcellent;
+            bool isAncient = details.IsAncient;
+
+            return new ItemRenderProperties(level, isExcellent, isAncient);
+        }
+
+        private static string BuildCacheKey(ItemDefinition definition, int width, int height, float rotationAngle, in ItemRenderProperties props)
+        {
+            if (definition == null || string.IsNullOrWhiteSpace(definition.TexturePath))
+            {
+                return string.Empty;
+            }
+
+            string key = $"{definition.TexturePath}:{width}x{height}";
+            if (rotationAngle != 0f)
+            {
+                key = $"{key}:{rotationAngle:F0}";
+            }
+
+            if (props.RequiresDistinctKey)
+            {
+                key = $"{key}:lvl{props.Level:X2}:ex{(props.IsExcellent ? 1 : 0)}:an{(props.IsAncient ? 1 : 0)}";
+            }
+
+            return key;
+        }
+
+        private static PreviewCacheEntry GetCacheEntry(string key, bool isRotating)
+        {
+            if (string.IsNullOrEmpty(key))
+            {
+                return null;
+            }
+
+            if (!isRotating)
+            {
+                return _cache.TryGetValue(key, out var cached) ? cached : null;
+            }
+
+            return _rotatingCache.TryGetValue(key, out var cachedRot) ? cachedRot : null;
+        }
+
+        private static void StoreCacheEntry(string key, PreviewCacheEntry entry, bool isRotating)
+        {
+            if (string.IsNullOrEmpty(key) || entry == null)
+            {
+                return;
+            }
+
+            if (!isRotating)
+            {
+                if (_cache.TryGetValue(key, out var existing) && !ReferenceEquals(existing, entry))
+                {
+                    existing.Dispose();
+                }
+                _cache[key] = entry;
+                return;
+            }
+
+            if (!_rotatingCache.ContainsKey(key))
+            {
+                _rotatingCacheKeys.Enqueue(key);
+            }
+            else if (!ReferenceEquals(_rotatingCache[key], entry))
+            {
+                _rotatingCache[key]?.Dispose();
+            }
+
+            _rotatingCache[key] = entry;
+
+            while (_rotatingCacheKeys.Count > MaxRotatingCacheSize)
+            {
+                string oldestKey = _rotatingCacheKeys.Dequeue();
+                if (_rotatingCache.TryGetValue(oldestKey, out var removed))
+                {
+                    removed.Dispose();
+                    _rotatingCache.Remove(oldestKey);
+                }
+            }
+        }
+
+        private static float ResolveEffectTime(GameTime gameTime)
+        {
+            if (gameTime != null)
+            {
+                return (float)gameTime.TotalGameTime.TotalSeconds;
+            }
+
+            var muTime = MuGame.Instance?.GameTime;
+            if (muTime != null)
+            {
+                return (float)muTime.TotalGameTime.TotalSeconds;
+            }
+
+            return Environment.TickCount * 0.001f;
+        }
 
         public static Texture2D GetPreview(ItemDefinition definition, int width, int height, float rotationAngle = 0f)
         {
-            if (definition == null || string.IsNullOrWhiteSpace(definition.TexturePath))
-                return null;
+            return GetPreviewInternal(definition, width, height, rotationAngle, ItemRenderProperties.Default, gameTime: null, useCache: true);
+        }
 
-            string baseKey = $"{definition.TexturePath}:{width}x{height}";
-            string key = rotationAngle == 0f ? baseKey : $"{baseKey}:{rotationAngle:F0}";
+        public static Texture2D GetPreview(InventoryItem item, int width, int height, float rotationAngle = 0f)
+        {
+            return GetPreviewInternal(item?.Definition, width, height, rotationAngle, CreateRenderProperties(item), gameTime: null, useCache: true);
+        }
 
-            // Check appropriate cache
-            if (rotationAngle == 0f)
-            {
-                if (_cache.TryGetValue(key, out var cachedTex))
-                    return cachedTex;
-            }
-            else
-            {
-                if (_rotatingCache.TryGetValue(key, out var cachedTex))
-                    return cachedTex;
+        /// <summary>
+        /// Tries to retrieve a cached preview without rendering a new one. Returns null if not cached.
+        /// </summary>
+        public static Texture2D TryGetCachedPreview(ItemDefinition definition, int width, int height, float rotationAngle = 0f)
+        {
+            var key = BuildCacheKey(definition, width, height, rotationAngle, ItemRenderProperties.Default);
+            return GetCacheEntry(key, rotationAngle != 0f)?.Texture;
+        }
 
-                // Clean up rotating cache periodically
-                if (++_rotatingCacheCleanupCounter > MaxRotatingCacheSize)
-                {
-                    _rotatingCache.Clear();
-                    _rotatingCacheCleanupCounter = 0;
-                }
-            }
-
-            // Skip if we know this render failed before
-            if (_failedRenders.Contains(key))
-                return null;
-
-            Texture2D tex = null;
-            try
-            {
-                tex = Render(definition, width, height, rotationAngle);
-                if (tex != null)
-                {
-                    if (rotationAngle == 0f)
-                    {
-                        // Cache static previews permanently
-                        _cache[key] = tex;
-                    }
-                    else
-                    {
-                        // Cache rotating previews temporarily
-                        _rotatingCache[key] = tex;
-                    }
-                }
-                else
-                {
-                    // Mark as failed to avoid repeated attempts
-                    _failedRenders.Add(key);
-                }
-            }
-            catch (InvalidOperationException ex) when (ex.Message.Contains("UI thread"))
-            {
-                // We're not on the UI thread, mark as failed and return null
-                _failedRenders.Add(key);
-                return null;
-            }
-            catch (Exception)
-            {
-                // Other rendering errors, mark as failed
-                _failedRenders.Add(key);
-                return null;
-            }
-
-            return tex;
+        public static Texture2D TryGetCachedPreview(InventoryItem item, int width, int height, float rotationAngle = 0f)
+        {
+            var key = BuildCacheKey(item?.Definition, width, height, rotationAngle, CreateRenderProperties(item));
+            return GetCacheEntry(key, rotationAngle != 0f)?.Texture;
         }
 
         /// <summary>
@@ -100,14 +218,38 @@ namespace Client.Main.Controls.UI.Game.Inventory
             if (gameTime == null)
                 return GetPreview(definition, width, height, 0f);
 
-            // Create smooth rotation based on game time (360° over 3 seconds)
-            float rotationSpeed = 120f; // degrees per second (slower for smoother look)
-            float rotationAngle = (float)(gameTime.TotalGameTime.TotalSeconds * rotationSpeed) % 360f;
+            float rotationAngle = CalculateCachedRotationAngle(gameTime.TotalGameTime.TotalSeconds, 120f);
+            return GetPreviewInternal(definition, width, height, rotationAngle, ItemRenderProperties.Default, gameTime, useCache: true);
+        }
 
-            // Round to 5-degree increments for smoother animation but still cache-friendly
-            rotationAngle = MathF.Round(rotationAngle);
+        public static Texture2D GetAnimatedPreview(InventoryItem item, int width, int height, GameTime gameTime)
+        {
+            if (gameTime == null)
+                return GetPreview(item, width, height, 0f);
 
-            return GetPreview(definition, width, height, rotationAngle);
+            float rotationAngle = CalculateCachedRotationAngle(gameTime.TotalGameTime.TotalSeconds, 120f);
+            return GetPreviewInternal(item?.Definition, width, height, rotationAngle, CreateRenderProperties(item), gameTime, useCache: true);
+        }
+
+        /// <summary>
+        /// Creates a smooth animated rotating preview for mouse hover effect (no angle rounding)
+        /// </summary>
+        public static Texture2D GetSmoothAnimatedPreview(ItemDefinition definition, int width, int height, GameTime gameTime)
+        {
+            if (gameTime == null)
+                return GetPreview(definition, width, height, 0f);
+
+            float rotationAngle = CalculateRawRotationAngle(gameTime.TotalGameTime.TotalSeconds, 120f);
+            return GetPreviewInternal(definition, width, height, rotationAngle, ItemRenderProperties.Default, gameTime, useCache: true);
+        }
+
+        public static Texture2D GetSmoothAnimatedPreview(InventoryItem item, int width, int height, GameTime gameTime)
+        {
+            if (gameTime == null)
+                return GetPreview(item, width, height, 0f);
+
+            float rotationAngle = CalculateRawRotationAngle(gameTime.TotalGameTime.TotalSeconds, 120f);
+            return GetPreviewInternal(item?.Definition, width, height, rotationAngle, CreateRenderProperties(item), gameTime, useCache: true);
         }
 
         /// <summary>
@@ -118,11 +260,17 @@ namespace Client.Main.Controls.UI.Game.Inventory
             if (gameTime == null)
                 return GetPreview(definition, width, height, 0f);
 
-            // Create very obvious rotation (90 degrees every second for testing)
-            float rotationSpeed = 90f; // degrees per second
-            float rotationAngle = (float)(gameTime.TotalGameTime.TotalSeconds * rotationSpeed) % 360f;
+            float rotationAngle = CalculateCachedRotationAngle(gameTime.TotalGameTime.TotalSeconds, 90f);
+            return GetPreviewInternal(definition, width, height, rotationAngle, ItemRenderProperties.Default, gameTime, useCache: true);
+        }
 
-            return GetPreview(definition, width, height, rotationAngle);
+        public static Texture2D GetTestRotatingPreview(InventoryItem item, int width, int height, GameTime gameTime)
+        {
+            if (gameTime == null)
+                return GetPreview(item, width, height, 0f);
+
+            float rotationAngle = CalculateCachedRotationAngle(gameTime.TotalGameTime.TotalSeconds, 90f);
+            return GetPreviewInternal(item?.Definition, width, height, rotationAngle, CreateRenderProperties(item), gameTime, useCache: true);
         }
 
         /// <summary>
@@ -133,130 +281,204 @@ namespace Client.Main.Controls.UI.Game.Inventory
             if (gameTime == null)
                 return GetPreview(definition, width, height, 0f);
 
-            // Perfectly smooth rotation (no rounding for cache)
-            float rotationSpeed = 120f; // degrees per second
-            float rotationAngle = (float)(gameTime.TotalGameTime.TotalSeconds * rotationSpeed) % 360f;
-
-            // Don't use cache for perfectly smooth animation
-            return Render(definition, width, height, rotationAngle);
+            float rotationAngle = CalculateRawRotationAngle(gameTime.TotalGameTime.TotalSeconds, 120f);
+            return Render(definition, width, height, rotationAngle, ItemRenderProperties.Default, gameTime);
         }
 
-        private static Texture2D Render(ItemDefinition def, int width, int height, float rotationAngle = 0f)
+        public static Texture2D GetSmoothRotatingPreview(InventoryItem item, int width, int height, GameTime gameTime)
         {
+            if (gameTime == null)
+                return GetPreview(item, width, height, 0f);
+
+            float rotationAngle = CalculateRawRotationAngle(gameTime.TotalGameTime.TotalSeconds, 120f);
+            return Render(item?.Definition, width, height, rotationAngle, CreateRenderProperties(item), gameTime);
+        }
+
+        /// <summary>
+        /// Retrieves a preview that allows item material shader animation to advance over time without requiring hover.
+        /// </summary>
+        public static Texture2D GetMaterialAnimatedPreview(InventoryItem item, int width, int height, GameTime gameTime)
+        {
+            return GetPreviewInternal(item?.Definition, width, height, 0f, CreateRenderProperties(item), gameTime, useCache: true);
+        }
+
+        private static float CalculateCachedRotationAngle(double totalSeconds, float speedDegreesPerSecond)
+        {
+            float angle = CalculateRawRotationAngle(totalSeconds, speedDegreesPerSecond);
+            return MathF.Round(angle / 5f) * 5f;
+        }
+
+        private static float CalculateRawRotationAngle(double totalSeconds, float speedDegreesPerSecond)
+        {
+            return (float)(totalSeconds * speedDegreesPerSecond) % 360f;
+        }
+
+        private static Texture2D GetPreviewInternal(ItemDefinition definition, int width, int height, float rotationAngle, in ItemRenderProperties props, GameTime gameTime, bool useCache)
+        {
+            if (definition == null || string.IsNullOrWhiteSpace(definition.TexturePath))
+                return null;
+
+            bool isRotating = rotationAngle != 0f;
+            string key = BuildCacheKey(definition, width, height, rotationAngle, props);
+            float now = ResolveEffectTime(gameTime);
+            bool requiresAnimation = props.ShouldUseItemMaterial && Constants.ENABLE_ITEM_MATERIAL_ANIMATION;
+
+            PreviewCacheEntry entry = useCache ? GetCacheEntry(key, isRotating) : null;
+
+            if (!useCache && _failedRenders.Contains(key) && entry == null)
+            {
+                return null;
+            }
+
+            if (entry != null && (!requiresAnimation || now - entry.LastUpdateTime < AnimatedUpdateInterval))
+            {
+                return entry.Texture;
+            }
+
+            if (entry == null && _failedRenders.Contains(key))
+            {
+                return null;
+            }
+
             try
             {
-                var gd = GraphicsManager.Instance.GraphicsDevice;
-                if (gd == null)
-                    return null;
+                var target = entry?.Texture;
+                var rendered = Render(definition, width, height, rotationAngle, props, gameTime, target);
 
+                if (rendered == null)
+                {
+                    // Don't mark as failed immediately - model might still be loading
+                    // Will retry on next frame. Only mark as failed after exception or repeated failures.
+                    return entry?.Texture;
+                }
+
+                if (!useCache)
+                {
+                    _failedRenders.Remove(key);
+                    return rendered;
+                }
+
+                if (entry == null)
+                {
+                    entry = new PreviewCacheEntry(rendered, now, requiresAnimation);
+                    StoreCacheEntry(key, entry, isRotating);
+                }
+                else
+                {
+                    entry.UpdateTexture(rendered);
+                    entry.LastUpdateTime = now;
+                    entry.RequiresAnimation = requiresAnimation;
+                }
+
+                _failedRenders.Remove(key);
+                return entry.Texture;
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("UI thread"))
+            {
+                if (entry == null)
+                {
+                    _failedRenders.Add(key);
+                }
+                return entry?.Texture;
+            }
+            catch (Exception)
+            {
+                if (entry == null)
+                {
+                    _failedRenders.Add(key);
+                }
+                return entry?.Texture;
+            }
+        }
+
+        private static RenderTarget2D Render(ItemDefinition def, int width, int height, float rotationAngle, in ItemRenderProperties props, GameTime gameTime, RenderTarget2D target = null)
+        {
+            RenderTarget2D rt = target;
+            bool createdNewTarget = false;
+            var gd = GraphicsManager.Instance.GraphicsDevice;
+            if (gd == null)
+                return target;
+
+            RenderTargetBinding[] prevTargets = null;
+            BlendState originalBlendState = null;
+            DepthStencilState originalDepthStencilState = null;
+            RasterizerState originalRasterizerState = null;
+            SamplerState originalSamplerState = null;
+            bool capturedStates = false;
+            try
+            {
                 var modelTask = BMDLoader.Instance.Prepare(def.TexturePath);
-                // Use ConfigureAwait(false) to avoid deadlocks and run on thread pool
-                var bmd = modelTask.ConfigureAwait(false).GetAwaiter().GetResult();
-                if (bmd == null)
-                    return null;
 
-                var bones = BuildBoneMatrices(bmd);
+                // DirectX requires more careful thread synchronization to avoid deadlocks
+                // Only wait for model if it's already completed, otherwise return and retry next frame
+                if (!modelTask.IsCompleted)
+                {
+                    // Model still loading - ensure task is running and return early
+                    // Caller will retry on next frame when model is ready
+                    _ = modelTask; // Reference task to ensure it stays alive
+                    return target;
+                }
+
+                // Model is loaded, safe to get result synchronously
+                var bmd = modelTask.Result;
+                if (bmd == null)
+                    return target;
+
+                var bones = BuildBoneMatrices(bmd, def);
                 var originalBounds = ComputeBounds(bmd, bones);
 
-                // ── render-target ─────────────────────────────────────────────────────
-                var rt = new RenderTarget2D(gd, width, height, false,
-                                            SurfaceFormat.Color, DepthFormat.Depth24);
-                var prevTargets = gd.GetRenderTargets();
-                var originalBlendState = gd.BlendState;
-                var originalDepthStencilState = gd.DepthStencilState;
-                var originalRasterizerState = gd.RasterizerState;
+                if (rt == null || rt.IsDisposed || rt.Width != width || rt.Height != height)
+                {
+                    target?.Dispose();
+                    rt = new RenderTarget2D(gd, width, height, false, SurfaceFormat.Color, DepthFormat.Depth24);
+                    createdNewTarget = true;
+                }
+
+                prevTargets = gd.GetRenderTargets();
+                originalBlendState = gd.BlendState;
+                originalDepthStencilState = gd.DepthStencilState;
+                originalRasterizerState = gd.RasterizerState;
+                originalSamplerState = gd.SamplerStates[0];
+                capturedStates = true;
 
                 gd.SetRenderTarget(rt);
                 gd.Clear(Color.Transparent);
 
-                // Set appropriate render states for 3D preview
                 gd.BlendState = BlendState.AlphaBlend;
                 gd.DepthStencilState = DepthStencilState.Default;
-                gd.RasterizerState = RasterizerState.CullNone; // Show both sides for inventory items
+                gd.RasterizerState = RasterizerState.CullNone;
+                gd.SamplerStates[0] = GraphicsManager.GetQualityLinearSamplerState();
 
-                // ── basic effect ──────────────────────────────────────────────────────
-                var effect = GraphicsManager.Instance.BasicEffect3D;
-                Matrix oldV = effect.View;
-                Matrix oldP = effect.Projection;
-                Matrix oldW = effect.World;
+                Matrix view = Matrix.CreateLookAt(new Vector3(0, 0, 40f), Vector3.Zero, Vector3.Up);
+                Matrix projection = Matrix.CreatePerspectiveFieldOfView(MathHelper.ToRadians(30f), (float)width / height, 1f, 100f);
 
-                effect.View = Matrix.CreateLookAt(new Vector3(0, 0, 40f),
-                                                  Vector3.Zero, Vector3.Up);
-                effect.Projection = Matrix.CreatePerspectiveFieldOfView(
-                                        MathHelper.ToRadians(30f),
-                                        (float)width / height,
-                                        1f, 100f);
+                Matrix baseRotation = ItemOrientationHelper.GetInventoryBaseRotation(def);
 
-                // ── Calculate rotation based on item group ──
-                Matrix baseRotation = MuRotationConverter.ConvertToMonoGame(25f, 45f, 0f);
-
-                if (def.Group == 0 || def.Group == 1 || def.Group == 2 || def.Group == 3 || def.Group == 5)
-                {
-                    baseRotation = MuRotationConverter.ConvertToMonoGame(25f, 45f, 0f);
-                }
-                else if (def.Group == 6)
-                {
-                    baseRotation = MuRotationConverter.ConvertToMonoGame(270f, 270f, 0f);
-                }
-                else if (def.Group == 13) //helpers
-                {
-                    baseRotation = MuRotationConverter.ConvertToMonoGame(270f, 0f, 0f);
-                }
-                else if (def.Group == 14) //potions
-                {
-                    baseRotation = MuRotationConverter.ConvertToMonoGame(270f, 0f, 0f);
-                }
-                else
-                {
-                    baseRotation = MuRotationConverter.ConvertToMonoGame(270f, -10f, 0f);
-                }
-
-                // Add mouse-over rotation (around Y-axis for horizontal spin)
                 Matrix mouseRotation = Matrix.CreateRotationY(MathHelper.ToRadians(rotationAngle));
 
-                // For stable centering, use the base rotation for bounding box calculation
-                // but apply mouse rotation separately
                 Vector3[] originalCorners = originalBounds.GetCorners();
                 Vector3 rotatedMin = new Vector3(float.MaxValue);
                 Vector3 rotatedMax = new Vector3(float.MinValue);
 
-                Matrix rotationForBounds;
-                if (rotationAngle == 0f)
-                {
-                    rotationForBounds = baseRotation;
-                }
-                else
-                {
-                    rotationForBounds = baseRotation;
-                }
-
                 foreach (Vector3 corner in originalCorners)
                 {
-                    Vector3 rotatedCorner = Vector3.Transform(corner, rotationForBounds);
+                    Vector3 rotatedCorner = Vector3.Transform(corner, baseRotation);
                     rotatedMin = Vector3.Min(rotatedMin, rotatedCorner);
                     rotatedMax = Vector3.Max(rotatedMax, rotatedCorner);
                 }
 
-                // Create new bounding box 
                 BoundingBox rotatedBounds = new BoundingBox(rotatedMin, rotatedMax);
                 Vector3 rotatedSize = rotatedBounds.Max - rotatedBounds.Min;
 
-                // Calculate scale based on size
                 float scale = 15f / Math.Max(rotatedSize.X, Math.Max(rotatedSize.Y, rotatedSize.Z));
 
                 Vector3 originalCenter = (originalBounds.Min + originalBounds.Max) * 0.5f;
 
-                Matrix finalRotation = baseRotation;
-                if (rotationAngle != 0f)
-                {
-                    finalRotation = baseRotation * mouseRotation;
-                }
+                Matrix finalRotation = rotationAngle != 0f ? baseRotation * mouseRotation : baseRotation;
 
-                Matrix worldBase = Matrix.CreateScale(scale) *
-                                  finalRotation *
-                                  Matrix.CreateTranslation(-originalCenter * scale);
+                Matrix worldBase = Matrix.CreateScale(scale) * finalRotation * Matrix.CreateTranslation(-originalCenter * scale);
 
-                Vector3[] transformedCorners = new Vector3[8];
+                var transformedCorners = _transformedCornersBuffer;
                 for (int i = 0; i < originalCorners.Length; i++)
                 {
                     transformedCorners[i] = Vector3.Transform(originalCorners[i], worldBase);
@@ -280,33 +502,74 @@ namespace Client.Main.Controls.UI.Game.Inventory
                 float yOffset = -(minY + maxY) * 0.5f;
                 float zOffset = -(minZ + maxZ) * 0.5f;
 
-                effect.World = worldBase * Matrix.CreateTranslation(xOffset, yOffset, zOffset);
+                Matrix world = worldBase * Matrix.CreateTranslation(xOffset, yOffset, zOffset);
+                Matrix worldViewProjection = world * view * projection;
+                Vector3 eyePosition = new Vector3(0f, 0f, 40f);
 
-                // ── Render meshes with proper BlendState support ──
+                bool useItemMaterial = props.ShouldUseItemMaterial &&
+                                       Constants.ENABLE_ITEM_MATERIAL_SHADER &&
+                                       GraphicsManager.Instance.ItemMaterialEffect != null;
+
                 var meshOrder = GetMeshRenderOrder(bmd);
 
-                foreach (int meshIdx in meshOrder)
+                if (!useItemMaterial)
                 {
-                    RenderMeshWithBlendState(gd, effect, bmd, meshIdx, bones);
+                    var effect = GraphicsManager.Instance.BasicEffect3D;
+                    Matrix oldV = effect.View;
+                    Matrix oldP = effect.Projection;
+                    Matrix oldW = effect.World;
+
+                    effect.View = view;
+                    effect.Projection = projection;
+                    effect.World = world;
+
+                    foreach (int meshIdx in meshOrder)
+                    {
+                        RenderMeshWithBlendState(gd, effect, bmd, meshIdx, bones);
+                    }
+
+                    effect.View = oldV;
+                    effect.Projection = oldP;
+                    effect.World = oldW;
                 }
-
-                // Restore effect matrices
-                effect.View = oldV;
-                effect.Projection = oldP;
-                effect.World = oldW;
-
-                // Restore render states
-                gd.SetRenderTarget(null);
-                gd.SetRenderTargets(prevTargets);
-                gd.BlendState = originalBlendState;
-                gd.DepthStencilState = originalDepthStencilState;
-                gd.RasterizerState = originalRasterizerState;
+                else
+                {
+                    float shaderTime = ResolveEffectTime(gameTime);
+                    foreach (int meshIdx in meshOrder)
+                    {
+                        RenderMeshWithItemMaterialPreview(gd, bmd, meshIdx, bones, world, view, projection, worldViewProjection, eyePosition, props, shaderTime);
+                    }
+                }
 
                 return rt;
             }
             catch
             {
-                return null;
+                if (createdNewTarget && rt != null && !rt.IsDisposed)
+                {
+                    rt.Dispose();
+                    rt = null;
+                }
+                return target ?? rt;
+            }
+            finally
+            {
+                if (capturedStates)
+                {
+                    if (prevTargets != null && prevTargets.Length > 0)
+                    {
+                        gd.SetRenderTargets(prevTargets);
+                    }
+                    else
+                    {
+                        gd.SetRenderTarget(null);
+                    }
+
+                    gd.BlendState = originalBlendState;
+                    gd.DepthStencilState = originalDepthStencilState;
+                    gd.RasterizerState = originalRasterizerState;
+                    gd.SamplerStates[0] = originalSamplerState;
+                }
             }
         }
 
@@ -396,6 +659,94 @@ namespace Client.Main.Controls.UI.Game.Inventory
             }
         }
 
+        private static void RenderMeshWithItemMaterialPreview(GraphicsDevice gd,
+                                                              Client.Data.BMD.BMD bmd,
+                                                              int meshIdx,
+                                                              Matrix[] bones,
+                                                              Matrix world,
+                                                              Matrix view,
+                                                              Matrix projection,
+                                                              Matrix worldViewProjection,
+                                                              Vector3 eyePosition,
+                                                              in ItemRenderProperties props,
+                                                              float shaderTime)
+        {
+            var effect = GraphicsManager.Instance.ItemMaterialEffect;
+            if (effect == null)
+            {
+                return;
+            }
+
+            var mesh = bmd.Meshes[meshIdx];
+
+            var currentBlendState = gd.BlendState;
+            var currentRasterizerState = gd.RasterizerState;
+
+            try
+            {
+                BlendState customBlendState = GetBlendStateForMesh(mesh);
+                if (customBlendState != null)
+                {
+                    gd.BlendState = customBlendState;
+                }
+
+                bool isTwoSided = customBlendState != null && customBlendState != BlendState.Opaque;
+                if (isTwoSided)
+                {
+                    gd.RasterizerState = RasterizerState.CullNone;
+                }
+
+                DynamicVertexBuffer vb = null;
+                DynamicIndexBuffer ib = null;
+
+                BMDLoader.Instance.GetModelBuffers(bmd, meshIdx, Color.White, bones, ref vb, ref ib, skipCache: false);
+
+                if (vb == null || ib == null)
+                {
+                    return;
+                }
+
+                var texturePath = BMDLoader.Instance.GetTexturePath(bmd, mesh.TexturePath);
+                if (string.IsNullOrEmpty(texturePath))
+                {
+                    return;
+                }
+
+                var texture = TextureLoader.Instance.GetTexture2D(texturePath);
+                if (texture == null)
+                {
+                    return;
+                }
+
+                effect.Parameters["World"]?.SetValue(world);
+                effect.Parameters["View"]?.SetValue(view);
+                effect.Parameters["Projection"]?.SetValue(projection);
+                effect.Parameters["WorldViewProjection"]?.SetValue(worldViewProjection);
+                effect.Parameters["EyePosition"]?.SetValue(eyePosition);
+                effect.Parameters["DiffuseTexture"]?.SetValue(texture);
+                effect.Parameters["ItemOptions"]?.SetValue(props.ItemOptions);
+                effect.Parameters["IsExcellent"]?.SetValue(props.IsExcellent);
+                effect.Parameters["IsAncient"]?.SetValue(props.IsAncient);
+                effect.Parameters["Time"]?.SetValue(shaderTime);
+                effect.Parameters["Alpha"]?.SetValue(1f);
+
+                gd.SetVertexBuffer(vb);
+                gd.Indices = ib;
+
+                int primitiveCount = ib.IndexCount / 3;
+                foreach (var pass in effect.CurrentTechnique.Passes)
+                {
+                    pass.Apply();
+                    gd.DrawIndexedPrimitives(PrimitiveType.TriangleList, 0, 0, primitiveCount);
+                }
+            }
+            finally
+            {
+                gd.BlendState = currentBlendState;
+                gd.RasterizerState = currentRasterizerState;
+            }
+        }
+
         private static BlendState GetBlendStateForMesh(Client.Data.BMD.BMDTextureMesh mesh)
         {
             if (string.IsNullOrEmpty(mesh.BlendingMode))
@@ -426,31 +777,60 @@ namespace Client.Main.Controls.UI.Game.Inventory
             return null;
         }
 
-        private static Matrix[] BuildBoneMatrices(Client.Data.BMD.BMD bmd)
+        private static Matrix[] BuildBoneMatrices(Client.Data.BMD.BMD bmd, ItemDefinition definition = null)
         {
             var bones = bmd.Bones;
             var result = new Matrix[bones.Length];
-            for (int i = 0; i < bones.Length; i++)
+
+            int group = definition?.Group ?? -1;
+            bool isArmor = group >= 7 && group <= 11;
+            var playerBones = PlayerIdlePoseProvider.GetIdleBoneMatrices();
+
+            if (isArmor && playerBones != null && playerBones.Length > 0)
             {
-                var bone = bones[i];
-                Matrix local = Matrix.Identity;
-                if (bone.Matrixes != null && bone.Matrixes.Length > 0)
+                for (int i = 0; i < bones.Length; i++)
                 {
-                    var bm = bone.Matrixes[0];
-                    if (bm.Position?.Length > 0 && bm.Quaternion?.Length > 0)
+                    if (i < playerBones.Length)
                     {
-                        var q = bm.Quaternion[0];
-                        local = Matrix.CreateFromQuaternion(new Microsoft.Xna.Framework.Quaternion(q.X, q.Y, q.Z, q.W));
-                        var p = bm.Position[0];
-                        local.Translation = new Vector3(p.X, p.Y, p.Z);
+                        result[i] = playerBones[i];
+                    }
+                    else
+                    {
+                        result[i] = BuildSingleBoneMatrix(bones[i], result);
                     }
                 }
-                if (bone.Parent >= 0 && bone.Parent < result.Length)
-                    result[i] = local * result[bone.Parent];
-                else
-                    result[i] = local;
             }
+            else
+            {
+                for (int i = 0; i < bones.Length; i++)
+                {
+                    result[i] = BuildSingleBoneMatrix(bones[i], result);
+                }
+            }
+
             return result;
+        }
+
+        private static Matrix BuildSingleBoneMatrix(Client.Data.BMD.BMDTextureBone bone, Matrix[] parentResults)
+        {
+            Matrix local = Matrix.Identity;
+
+            if (bone?.Matrixes != null && bone.Matrixes.Length > 0)
+            {
+                var bm = bone.Matrixes[0];
+                if (bm.Position?.Length > 0 && bm.Quaternion?.Length > 0)
+                {
+                    var q = bm.Quaternion[0];
+                    local = Matrix.CreateFromQuaternion(new Microsoft.Xna.Framework.Quaternion(q.X, q.Y, q.Z, q.W));
+                    var p = bm.Position[0];
+                    local.Translation = new Vector3(p.X, p.Y, p.Z);
+                }
+            }
+
+            if (bone != null && bone.Parent >= 0 && bone.Parent < parentResults.Length)
+                return local * parentResults[bone.Parent];
+
+            return local;
         }
 
         private static BoundingBox ComputeBounds(Client.Data.BMD.BMD bmd, Matrix[] bones)
@@ -468,6 +848,120 @@ namespace Client.Main.Controls.UI.Game.Inventory
                 }
             }
             return new BoundingBox(min, max);
+        }
+    }
+
+    internal static class ItemOrientationHelper
+    {
+        private const float MinAxisLengthSq = 1e-6f;
+
+        public static Matrix GetInventoryBaseRotation(ItemDefinition definition)
+        {
+            if (definition == null)
+            {
+                return MuRotationConverter.ConvertToMonoGame(25f, 45f, 0f);
+            }
+
+            short group = (short)definition.Group;
+            if (group == 6)
+            {
+                return MuRotationConverter.ConvertToMonoGame(270f, 270f, 0f);
+            }
+
+            if (group == 13 || group == 14)
+            {
+                return MuRotationConverter.ConvertToMonoGame(270f, 0f, 0f);
+            }
+
+            if (group == 0 || group == 1 || group == 2 || group == 3 || group == 5)
+            {
+                return MuRotationConverter.ConvertToMonoGame(25f, 45f, 0f);
+            }
+
+            return MuRotationConverter.ConvertToMonoGame(270f, -10f, 0f);
+        }
+
+        public static Quaternion GetInventoryOrientation(ItemDefinition definition)
+        {
+            Matrix rotation = GetInventoryBaseRotation(definition);
+            return Quaternion.CreateFromRotationMatrix(rotation);
+        }
+
+        public static Vector3 GetWorldDropEuler(ItemDefinition definition)
+        {
+            // Get the same MU rotation values used in inventory
+            (float muX, float muY, float muZ) = GetMuRotationValues(definition);
+
+            // Apply EXACTLY the same conversion as MuRotationConverter.ConvertToMonoGame
+            bool hasLargeAngle = (MathF.Abs(muX) >= 180f || MathF.Abs(muY) >= 180f || MathF.Abs(muZ) >= 180f);
+
+            float monoX = muX;
+            float monoY = -muY;
+            float monoZ = hasLargeAngle ? muZ : muZ + 180f;
+
+            // Convert to radians (ModelObject.Angle expects radians)
+            Vector3 inventoryAngle = new Vector3(
+                MathHelper.ToRadians(monoX),
+                MathHelper.ToRadians(monoY),
+                MathHelper.ToRadians(monoZ)
+            );
+
+            // Apply camera space transformation offset
+            // This rotates from inventory camera view to world space isometric view
+            inventoryAngle.X += -MathHelper.PiOver2; // -90° pitch
+            inventoryAngle.Y += MathHelper.PiOver2;  // +90° yaw
+
+            return inventoryAngle;
+        }
+
+        /// <summary>
+        /// Returns the MU Online rotation values for each item group
+        /// These are the same values used in GetInventoryBaseRotation
+        /// </summary>
+        private static (float muX, float muY, float muZ) GetMuRotationValues(ItemDefinition definition)
+        {
+            if (definition == null)
+            {
+                return (25f, 45f, 0f); // Default weapons
+            }
+
+            short group = (short)definition.Group;
+
+            // Shields
+            if (group == 6)
+            {
+                return (270f, 270f, 0f);
+            }
+
+            // Wings
+            if (group == 13 || group == 14)
+            {
+                return (270f, 0f, 0f);
+            }
+
+            // Weapons (swords, axes, maces, spears, bows)
+            if (group == 0 || group == 1 || group == 2 || group == 3 || group == 5)
+            {
+                return (25f, 45f, 0f);
+            }
+
+            // Default for other groups
+            return (270f, -10f, 0f);
+        }
+
+        private static float NormalizeAngle(float angle)
+        {
+            const float twoPi = MathF.PI * 2f;
+            angle %= twoPi;
+            if (angle <= -MathF.PI)
+            {
+                angle += twoPi;
+            }
+            else if (angle > MathF.PI)
+            {
+                angle -= twoPi;
+            }
+            return angle;
         }
     }
 

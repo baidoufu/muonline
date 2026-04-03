@@ -3,10 +3,12 @@ using System.Threading.Tasks;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Client.Main.Controllers;
+using Client.Main.Graphics;
 using Client.Main.Helpers;
 using Client.Main.Models;
 using Client.Main.Objects.Player;
 using Client.Main.Scenes;
+using Client.Main.Controls;
 
 namespace Client.Main.Objects.Effects
 {
@@ -16,9 +18,9 @@ namespace Client.Main.Objects.Effects
     public class DamageTextObject : WorldObject
     {
         // Public readonly data -------------------------------------------------
-        public string Text { get; }
-        public Color TextColor { get; }
-        public ushort TargetId { get; }
+        public string Text { get; private set; }
+        public Color TextColor { get; private set; }
+        public ushort TargetId { get; private set; }
 
         // Animation state ------------------------------------------------------
         private float _currentVerticalOffset;
@@ -31,13 +33,13 @@ namespace Client.Main.Objects.Effects
         private Vector2 _screenPosition;
 
         // Visual-effect helpers ------------------------------------------------
-        private readonly bool _isCritical;
-        private readonly float _wobbleAmplitude;
-        private readonly float _wobbleFrequency;
-        private readonly Vector2 _shadowOffset;
-        private readonly float _glowIntensity;
+        private bool _isCritical;
+        private float _wobbleAmplitude;
+        private float _wobbleFrequency;
+        private Vector2 _shadowOffset;
+        private float _glowIntensity;
         private float _pulsePhase;
-        private readonly Color _originalColor;
+        private Color _originalColor;
 
         // Tunables (already toned down vs. stock) ------------------------------
         private const float MaxVerticalOffset = 60f;
@@ -60,9 +62,38 @@ namespace Client.Main.Objects.Effects
         private const float GlowAlphaMul = 0.15f;  // was 0.30–0.60
         private const float HighlightAlphaMul = 0.075f; // was 0.15
 
+        private static readonly System.Collections.Concurrent.ConcurrentBag<DamageTextObject> _pool = new();
+
         // ---------------------------------------------------------------------
 
         public DamageTextObject(string text, ushort targetId, Color color)
+        {
+            Reset(text, targetId, color);
+        }
+
+        public static DamageTextObject Rent(string text, ushort targetId, Color color)
+        {
+            if (_pool.TryTake(out var obj))
+            {
+                obj.Reset(text, targetId, color);
+                return obj;
+            }
+            return new DamageTextObject(text, targetId, color);
+        }
+
+        public void Recycle()
+        {
+            try
+            {
+                Dispose();
+            }
+            finally
+            {
+                _pool.Add(this);
+            }
+        }
+
+        private void Reset(string text, ushort targetId, Color color)
         {
             Text = text;
             TargetId = targetId;
@@ -74,10 +105,20 @@ namespace Client.Main.Objects.Effects
             IsTransparent = true;
             AffectedByTransparency = false;
             Status = GameControlStatus.Ready;
+            Hidden = false;
+            _currentVerticalOffset = 0f;
+            _currentHorizontalOffset = 0f;
+            _verticalVelocity = 0f;
+            _horizontalVelocity = 0f;
+            _currentScale = StartScale;
+            _falling = false;
+            _elapsedTime = 0f;
+            _screenPosition = Vector2.Zero;
 
-            // Critical hit detection
-            _isCritical = text.Contains("!") || text.Contains("CRIT") ||
-                          (int.TryParse(text, out int dmg) && dmg > 500);
+            // Critical hit detection - enhanced to detect more crit patterns
+            _isCritical = text.Contains("!") || text.Contains("CRIT") || text.Contains("CRITICAL") ||
+                          (int.TryParse(text, out int dmg) && dmg > 500) ||
+                          text.EndsWith("!!") || text.StartsWith("*");
 
             // Randomised motion -------------------------------------------------
             float speedFactor = _isCritical ? 1.5f : 1f;
@@ -114,8 +155,9 @@ namespace Client.Main.Objects.Effects
             if (_elapsedTime >= Lifetime || Alpha <= 0.01f)
             {
                 Hidden = true;
-                World?.RemoveObject(this);
-                Dispose();
+                if (World is Controls.WorldControl wc)
+                    wc.RemoveObject(this);
+                Recycle();
                 return;
             }
 
@@ -168,7 +210,7 @@ namespace Client.Main.Objects.Effects
 
             // ------------------------------------------------ target + projection
             WalkerObject target = ResolveTarget();
-            if (target == null || target.Hidden || target.Status == GameControlStatus.Disposed || target.OutOfView)
+            if (target == null || target.Hidden || target.Status == GameControlStatus.Disposed)
             {
                 Hidden = true;
                 return;
@@ -182,10 +224,14 @@ namespace Client.Main.Objects.Effects
                 Camera.Instance.View,
                 Matrix.Identity);
 
-            // final screen coordinates
-            _screenPosition = new Vector2(
+            // Projected coordinates are already in the correct space
+
+            // final screen coordinates - convert to virtual coordinates for UiScaler
+            Vector2 screenPos = new Vector2(
                 proj.X + _currentHorizontalOffset + wobble,
                 proj.Y + _currentVerticalOffset);
+            var virtualPos = UiScaler.ToVirtual(new Point((int)screenPos.X, (int)screenPos.Y));
+            _screenPosition = new Vector2(virtualPos.X, virtualPos.Y);
 
             Hidden = (proj.Z < 0f || proj.Z > 1f);
             base.Update(gameTime);
@@ -206,6 +252,7 @@ namespace Client.Main.Objects.Effects
 
             const float fontSize = 12f;
             float baseScale = fontSize / Constants.BASE_FONT_SIZE;
+            // UiScaler will handle render scale transformation
             float scale = Math.Max(0.1f, baseScale * _currentScale);
             Vector2 origin = font.MeasureString(Text) * 0.5f;
 
@@ -242,7 +289,9 @@ namespace Client.Main.Objects.Effects
                 BlendState.AlphaBlend,
                 SamplerState.AnisotropicClamp,
                 DepthStencilState.None,
-                RasterizerState.CullNone))
+                RasterizerState.CullNone,
+                null,
+                UiScaler.SpriteTransform))
             {
                 // Shadow (only for bigger text)
                 if (scale > 0.8f)
@@ -347,6 +396,30 @@ namespace Client.Main.Objects.Effects
                        (ApproxHeadHeight + PlayerModelTopTextOffsetZ);
             }
 
+            // Prefer bone-based top for smoothness (avoids bbox throttling)
+            if (target is ModelObject model)
+            {
+                var bones = model.GetBoneTransforms();
+                if (bones != null && bones.Length > 0)
+                {
+                    float maxZ = float.MinValue;
+                    for (int i = 0; i < bones.Length; i++)
+                    {
+                        Vector3 local = bones[i].Translation;
+                        Vector3 world = Vector3.Transform(local, model.WorldPosition);
+                        if (world.Z > maxZ)
+                            maxZ = world.Z;
+                    }
+
+                    if (maxZ > float.MinValue)
+                    {
+                        var wp = model.WorldPosition.Translation;
+                        return new Vector3(wp.X, wp.Y, maxZ + MonsterBBoxTopTextOffsetZ);
+                    }
+                }
+            }
+
+            // Fallback to bbox if bones unavailable
             return new Vector3(
                 (target.BoundingBoxWorld.Min.X + target.BoundingBoxWorld.Max.X) * 0.5f,
                 (target.BoundingBoxWorld.Min.Y + target.BoundingBoxWorld.Max.Y) * 0.5f,

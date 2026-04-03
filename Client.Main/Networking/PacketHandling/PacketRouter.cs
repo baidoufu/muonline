@@ -36,7 +36,11 @@ namespace Client.Main.Networking.PacketHandling
         private readonly ChatMessageHandler _chatMessageHandler;
         private readonly ConnectServerHandler _connectServerHandler;
         private readonly MiscGamePacketHandler _miscGamePacketHandler;
+        private readonly LegacyQuestHandler _legacyQuestHandler;
         private readonly PartyHandler _partyHandler;
+        private readonly ShopHandler _shopHandler;
+        private readonly TradeHandler _tradeHandler;
+        private readonly BloodCastleHandler _bloodCastleHandler;
 
         private readonly Dictionary<(byte MainCode, byte SubCode), Func<Memory<byte>, Task>> _packetHandlers
             = new();
@@ -66,11 +70,15 @@ namespace Client.Main.Networking.PacketHandling
             // Instantiate handlers
             _characterDataHandler = new CharacterDataHandler(loggerFactory, characterState, networkManager, targetVersion);
             _inventoryHandler = new InventoryHandler(loggerFactory, characterState, networkManager, targetVersion);
-            _scopeHandler = new ScopeHandler(loggerFactory, scopeManager, characterState, networkManager, partyManager, targetVersion);
+            _scopeHandler = new ScopeHandler(loggerFactory, scopeManager, characterState, networkManager, partyManager, targetVersion, settings);
             _chatMessageHandler = new ChatMessageHandler(loggerFactory);
             _connectServerHandler = new ConnectServerHandler(loggerFactory, networkManager);
             _miscGamePacketHandler = new MiscGamePacketHandler(loggerFactory, networkManager, characterService, characterState, scopeManager, targetVersion);
+            _legacyQuestHandler = new LegacyQuestHandler(loggerFactory, characterState, characterService);
             _partyHandler = new PartyHandler(loggerFactory, partyManager, characterService, scopeManager, characterState);
+            _shopHandler = new ShopHandler(loggerFactory, characterState, networkManager, targetVersion);
+            _tradeHandler = new TradeHandler(loggerFactory, characterState, networkManager, targetVersion);
+            _bloodCastleHandler = new BloodCastleHandler(loggerFactory, characterState, networkManager);
 
             RegisterAttributeBasedHandlers();
             RegisterConnectServerHandlers();
@@ -95,7 +103,23 @@ namespace Client.Main.Networking.PacketHandling
         public Task RoutePacketAsync(ReadOnlySequence<byte> sequence)
         {
             var packet = sequence.ToArray().AsMemory();
-            _logger.LogDebug("Received packet ({Length} bytes): {Data}", packet.Length, Convert.ToHexString(packet.Span));
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                if (_settings?.PacketLogging?.LogPacketsHex == true)
+                {
+                    var span = packet.Span;
+                    int maxBytes = Math.Clamp(_settings.PacketLogging.LogPacketsHexMaxBytes, 1, span.Length);
+                    string hex = Convert.ToHexString(span.Slice(0, maxBytes));
+                    if (span.Length > maxBytes)
+                        hex = $"{hex}…(+{span.Length - maxBytes}B)";
+
+                    _logger.LogDebug("Received packet ({Length} bytes): {Data}", span.Length, hex);
+                }
+                else
+                {
+                    _logger.LogDebug("Received packet ({Length} bytes).", packet.Length);
+                }
+            }
 
             return _isConnectServerRouting
                 ? RouteConnectServerPacketAsync(packet)
@@ -209,7 +233,11 @@ namespace Client.Main.Networking.PacketHandling
                 _scopeHandler,
                 _chatMessageHandler,
                 _miscGamePacketHandler,
-                _partyHandler
+                _legacyQuestHandler,
+                _partyHandler,
+                _shopHandler,
+                _tradeHandler,
+                _bloodCastleHandler
             };
 
             int registered = 0;
@@ -276,7 +304,12 @@ namespace Client.Main.Networking.PacketHandling
                     case 0xC1:
                     case 0xC3:
                         code = span[2];
-                        subCode = (span.Length >= 4 && SubCodeHolder.ContainsSubCode(code))
+                        bool hasSubCode = SubCodeHolder.ContainsSubCode(code);
+                        if (TargetVersion >= TargetProtocolVersion.Season6 && code == 0x22)
+                        {
+                            hasSubCode = false; // Season 6 extended client uses value byte instead of sub-code.
+                        }
+                        subCode = (span.Length >= 4 && hasSubCode)
                                   ? span[3]
                                   : NoSubCode;
                         return true;
@@ -285,7 +318,12 @@ namespace Client.Main.Networking.PacketHandling
                     case 0xC4:
                         if (span.Length < 4) return false;
                         code = span[3];
-                        subCode = (span.Length >= 5 && SubCodeHolder.ContainsSubCode(code))
+                        bool hasSubCodeWide = SubCodeHolder.ContainsSubCode(code);
+                        if (TargetVersion >= TargetProtocolVersion.Season6 && code == 0x22)
+                        {
+                            hasSubCodeWide = false;
+                        }
+                        subCode = (span.Length >= 5 && hasSubCodeWide)
                                   ? span[4]
                                   : NoSubCode;
                         return true;

@@ -7,7 +7,7 @@ namespace Client.Main.Objects.Effects
     /// Top-level container that spawns magic circle + flares
     /// and destroys itself after _lifetime_ seconds.
     /// </summary>
-    public class LevelUpEffect : WorldObject
+    public class LevelUpEffect : EffectObject
     {
         private const float _lifetimeTotal = 3.5f;
         private float _lifetime = _lifetimeTotal;

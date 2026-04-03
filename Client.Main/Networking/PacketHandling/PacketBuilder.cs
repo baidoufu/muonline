@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Text;
 using Client.Main.Core.Client;
 using MUnique.OpenMU.Network.Packets;
@@ -113,6 +114,21 @@ namespace Client.Main.Networking.PacketHandling
             return length;
         }
 
+        /// <summary>
+        /// Builds a logout request packet with the specified logout type.
+        /// </summary>
+        public static int BuildLogoutRequestPacket(
+            IBufferWriter<byte> writer,
+            LogOutType type)
+        {
+            int length = LogOut.Length;
+            var memory = writer.GetMemory(length).Slice(0, length);
+            var packet = new LogOut(memory);
+
+            packet.Type = type;
+            return length;
+        }
+
         public static int BuildClientReadyAfterMapChangePacket(IBufferWriter<byte> writer)
         {
             int length = ClientReadyAfterMapChange.Length;
@@ -158,7 +174,7 @@ namespace Client.Main.Networking.PacketHandling
             packet.SourceX = startX;
             packet.SourceY = startY;
             packet.StepCount = (byte)path.Length;
-            packet.TargetRotation = path[0];
+            packet.TargetRotation = path[path.Length - 1];
 
             var directions = packet.Directions;
             int idx = 0;
@@ -200,6 +216,29 @@ namespace Client.Main.Networking.PacketHandling
         }
 
         /// <summary>
+        /// Builds a packet requesting to drop an inventory item onto the ground at the specified map tile.
+        /// </summary>
+        /// <param name="writer">The buffer writer.</param>
+        /// <param name="tileX">Target tile X on the map.</param>
+        /// <param name="tileY">Target tile Y on the map.</param>
+        /// <param name="inventorySlot">Inventory slot index (including server offset).</param>
+        /// <returns>The length of the built packet.</returns>
+        public static int BuildDropItemRequestPacket(
+            IBufferWriter<byte> writer,
+            byte tileX,
+            byte tileY,
+            byte inventorySlot)
+        {
+            int length = DropItemRequest.Length;
+            var memory = writer.GetMemory(length).Slice(0, length);
+            var packet = new DropItemRequest(memory);
+            packet.TargetX = tileX;
+            packet.TargetY = tileY;
+            packet.ItemSlot = inventorySlot;
+            return length;
+        }
+
+        /// <summary>
         /// Builds a packet to request an animation or rotation.
         /// </summary>
         public static int BuildAnimationRequestPacket(
@@ -217,71 +256,109 @@ namespace Client.Main.Networking.PacketHandling
         }
 
         /// <summary>
-        /// Builds a hit request packet for a basic attack.
+        /// Builds an ItemMoveRequest (with item data), typically for Season 6.
         /// </summary>
-        public static int BuildHitRequestPacket(
+        /// <param name="writer">Output writer.</param>
+        /// <param name="fromStorage">Source storage kind.</param>
+        /// <param name="fromSlot">Source slot.</param>
+        /// <param name="itemData">Item raw data (expected length 12 for S6).</param>
+        /// <param name="toStorage">Target storage kind.</param>
+        /// <param name="toSlot">Target slot.</param>
+        /// <returns>Packet length.</returns>
+        public static int BuildItemMoveRequestPacket(
             IBufferWriter<byte> writer,
-            ushort targetId,
-            byte attackAnimation,
-            byte lookingDirection)
+            ItemStorageKind fromStorage,
+            byte fromSlot,
+            ReadOnlySpan<byte> itemData,
+            ItemStorageKind toStorage,
+            byte toSlot)
         {
-            int length = HitRequest.Length;
+            int length = ItemMoveRequest.Length;
             var memory = writer.GetMemory(length).Slice(0, length);
-            var packet = new HitRequest(memory);
+            var packet = new ItemMoveRequest(memory);
+            packet.FromStorage = fromStorage;
+            packet.FromSlot = fromSlot;
+            // ItemData must fit into the packet span (12 bytes expected on S6)
+            var dest = packet.ItemData;
+            itemData.Slice(0, Math.Min(dest.Length, itemData.Length)).CopyTo(dest);
+            packet.ToStorage = toStorage;
+            packet.ToSlot = toSlot;
+            return length;
+        }
 
+        /// <summary>
+        /// Builds a short ItemMoveRequestExtended (storages + slots only).
+        /// </summary>
+        public static int BuildItemMoveRequestExtendedPacket(
+            IBufferWriter<byte> writer,
+            ItemStorageKind fromStorage,
+            byte fromSlot,
+            ItemStorageKind toStorage,
+            byte toSlot)
+        {
+            int length = ItemMoveRequestExtended.Length;
+            var memory = writer.GetMemory(length).Slice(0, length);
+            var packet = new ItemMoveRequestExtended(memory);
+            packet.FromStorage = fromStorage;
+            packet.FromSlot = fromSlot;
+            packet.ToStorage = toStorage;
+            packet.ToSlot = toSlot;
+            return length;
+        }
+
+
+        /// <summary>
+        /// Builds a skill usage request packet using TargetedSkill.
+        /// </summary>
+        public static int BuildSkillRequestPacket(
+            IBufferWriter<byte> writer,
+            ushort skillId,
+            ushort targetId)
+        {
+            int length = TargetedSkill.Length;
+            var memory = writer.GetMemory(length).Slice(0, length);
+            var packet = new TargetedSkill(memory);
+
+            packet.SkillId = skillId;
             packet.TargetId = targetId;
-            packet.AttackAnimation = attackAnimation;
-            packet.LookingDirection = lookingDirection;
 
             return length;
         }
 
+
         /// <summary>
-        /// Builds a packet to request increasing a character's stat point.
+        /// Builds an area skill hit packet (damage application) for Season 6+ (C3 DB).
         /// </summary>
-        /// <param name="writer">The buffer writer to write the packet to.</param>
-        /// <param name="attribute">The attribute to increase.</param>
-        /// <returns>The length of the built packet.</returns>
-        public static int BuildIncreaseCharacterStatPointPacket(
+        public static int BuildAreaSkillHitPacket(
             IBufferWriter<byte> writer,
-            CharacterStatAttribute attribute)
+            ushort skillId,
+            byte targetX,
+            byte targetY,
+            byte hitCounter,
+            IReadOnlyList<ushort> targetIds,
+            byte animationCounter)
         {
-            int length = IncreaseCharacterStatPoint.Length;
+            int targetCount = Math.Min(targetIds?.Count ?? 0, byte.MaxValue);
+            int length = AreaSkillHit.GetRequiredSize(targetCount);
             var memory = writer.GetMemory(length).Slice(0, length);
-            var packet = new IncreaseCharacterStatPoint(memory);
+            var packet = new AreaSkillHit(memory);
 
-            packet.StatType = attribute;
+            packet.SkillId = skillId;
+            packet.TargetX = targetX;
+            packet.TargetY = targetY;
+            packet.HitCounter = hitCounter;
+            packet.TargetCount = (byte)targetCount;
+
+            for (int i = 0; i < targetCount; i++)
+            {
+                var target = packet[i];
+                target.TargetId = targetIds[i];
+                target.AnimationCounter = animationCounter;
+            }
 
             return length;
         }
 
-        // ───────────────────── Connect Server Packets ──────────────────────
-
-        /// <summary>
-        /// Builds a request packet for the game server list from the connect server.
-        /// </summary>
-        public static int BuildServerListRequestPacket(IBufferWriter<byte> writer)
-        {
-            int length = ServerListRequest.Length;
-            var memory = writer.GetMemory(length).Slice(0, length);
-            _ = new ServerListRequest(memory);
-            return length;
-        }
-
-        /// <summary>
-        /// Builds a request packet for connection info of a specific game server.
-        /// </summary>
-        public static int BuildServerInfoRequestPacket(
-            IBufferWriter<byte> writer,
-            ushort serverId)
-        {
-            int length = ConnectionInfoRequest.Length;
-            var memory = writer.GetMemory(length).Slice(0, length);
-            var packet = new ConnectionInfoRequest(memory);
-
-            packet.ServerId = serverId;
-            return length;
-        }
 
         // ──────────────────────────── Helpers ─────────────────────────────
 

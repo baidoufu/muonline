@@ -1,6 +1,7 @@
 ﻿using Client.Data.Texture;
 using Client.Main.Content;
 using Client.Main.Controllers;
+using Client.Main.Graphics;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using System;
@@ -10,7 +11,6 @@ namespace Client.Main.Objects
 {
     public abstract class SpriteObject : WorldObject
     {
-        private Vector2 _screenPosition;
         private float _scaleMix = 1f;
 
         protected SpriteBatch SpriteBatch { get; private set; }
@@ -32,7 +32,7 @@ namespace Client.Main.Objects
 
             if (TextureData != null)
             {
-                SpriteBatch = new SpriteBatch(GraphicsDevice);
+                SpriteBatch = GraphicsManager.Instance.Sprite;
                 SpriteTexture = TextureLoader.Instance.GetTexture2D(TexturePath);
             }
             else
@@ -41,7 +41,7 @@ namespace Client.Main.Objects
             }
         }
 
-        
+
         public override void Draw(GameTime gameTime)
         {
             base.Draw(gameTime);
@@ -55,6 +55,14 @@ namespace Client.Main.Objects
                 Camera.Instance.Projection,
                 Camera.Instance.View,
                 Matrix.Identity);
+
+            // Projected coordinates are already in the correct space
+
+            // Keep sprite scaling in Draw to avoid per-frame projection work in Update (many sprite effects).
+            float worldScaleX = WorldPosition.Right.Length();
+            float distanceToCamera = Vector3.Distance(Camera.Instance.Position, WorldPosition.Translation);
+            float scaleFactor = Scale / (MathF.Max(distanceToCamera, 0.1f) / Constants.TERRAIN_SIZE);
+            _scaleMix = scaleFactor * worldScaleX * Constants.RENDER_SCALE;
 
             float layerDepth = MathHelper.Clamp(projected.Z, 0f, 1f);
 
@@ -75,9 +83,7 @@ namespace Client.Main.Objects
         protected void DrawSprite(Vector3 projected, float layerDepth)
         {
             var sb = GraphicsManager.Instance.Sprite;
-            Color color = (BlendState == BlendState.Additive)
-                ? Color.White * TotalAlpha
-                : (LightEnabled ? new Color(Light) * TotalAlpha : Color.White * TotalAlpha);
+            Color color = LightEnabled ? new Color(Light) * TotalAlpha : Color.White * TotalAlpha;
 
             sb.Draw(
                 SpriteTexture,
@@ -91,37 +97,10 @@ namespace Client.Main.Objects
                 layerDepth);
         }
 
-        public override void Update(GameTime gameTime)
-        {
-            base.Update(gameTime);
-
-            if (!Visible) return;
-
-            var screenPosition = GraphicsDevice.Viewport.Project(
-                WorldPosition.Translation,
-                Camera.Instance.Projection,
-                Camera.Instance.View,
-                Matrix.Identity
-            );
-
-            _screenPosition = new Vector2(screenPosition.X, screenPosition.Y);
-
-            Vector3 worldScale = new Vector3(
-                WorldPosition.Right.Length(),
-                WorldPosition.Up.Length(),
-                WorldPosition.Backward.Length()
-            );
-
-            float distanceToCamera = Vector3.Distance(Camera.Instance.Position, WorldPosition.Translation);
-            float scaleFactor = Scale / (MathF.Max(distanceToCamera, 0.1f) / Constants.TERRAIN_SIZE);
-            _scaleMix = scaleFactor * worldScale.X;
-        }
-
         public override void Dispose()
         {
             base.Dispose();
-
-            SpriteBatch?.Dispose();
+            SpriteBatch = null;
             SpriteTexture = null;
         }
     }

@@ -1,17 +1,15 @@
 ﻿using Client.Main.Content;
 using Client.Main.Controllers;
+using Client.Main.Helpers;
 using Client.Main.Models;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
 using System;
-using System.Linq;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
-#if ANDROID
-using Client.Main.Platform.Android;
-#endif
+using System.Collections.Generic;
+using Microsoft.Extensions.Logging;
 
 namespace Client.Main.Controls.UI
 {
@@ -21,9 +19,16 @@ namespace Client.Main.Controls.UI
         NineSlice
     }
 
-    public class TextFieldControl : UIControl
+    public class TextFieldControl : UIControl, IUiTexturePreloadable
     {
-        private readonly StringBuilder _inputText = new();
+        public static Type ControlType = typeof(TextFieldControl);
+
+        public static TextFieldControl Create()
+        {
+            return (TextFieldControl)Activator.CreateInstance(ControlType, true);
+        }
+
+        protected readonly StringBuilder _inputText = new();
         private double _cursorBlinkTimer;
         private bool _showCursor;
         private float _scrollOffset;
@@ -32,12 +37,19 @@ namespace Client.Main.Controls.UI
         private const int CursorBlinkInterval = 500;
 
         private Texture2D[] _nineSlice = new Texture2D[9];
+        private static readonly string[] s_nineSliceSuffixes =
+        {
+            "01", "02", "03", "04", "05", "06", "07", "08", "09"
+        };
+
+        private static readonly ILogger _logger = MuGame.AppLoggerFactory?.CreateLogger<TextFieldControl>();
 
         public TextFieldSkin Skin { get; set; } = TextFieldSkin.Flat;
         public Color TextColor { get; set; } = Color.White;
         public float FontSize { get; set; } = 12f;
-        public TextFieldControl NextInput { get; set; }
         public bool IsFocused { get; private set; }
+        public string Label { get; set; }
+        public string Placeholder { get; set; }
 
         public string Value
         {
@@ -55,12 +67,23 @@ namespace Client.Main.Controls.UI
         public event EventHandler ValueChanged;
         public event EventHandler EnterKeyPressed;
 
-        public TextFieldControl()
+        protected TextFieldControl()
         {
             AutoViewSize = false;
             ViewSize = new Point(176, 14);
             Interactive = true;
             IsFocused = false;
+        }
+
+        public IEnumerable<string> GetPreloadTexturePaths()
+        {
+            if (Skin != TextFieldSkin.NineSlice)
+                yield break;
+
+            for (int i = 0; i < s_nineSliceSuffixes.Length; i++)
+            {
+                yield return $"Interface/GFx/textbg{s_nineSliceSuffixes[i]}.ozd";
+            }
         }
 
         public override async Task Load()
@@ -69,33 +92,37 @@ namespace Client.Main.Controls.UI
 
             if (Skin == TextFieldSkin.NineSlice)
             {
-                var names = new[] { "01", "02", "03", "04", "05", "06", "07", "08", "09" };
-                for (int i = 0; i < 9; i++)
+                for (int i = 0; i < s_nineSliceSuffixes.Length; i++)
                 {
-                    _nineSlice[i] = await TextureLoader.Instance.PrepareAndGetTexture($"Interface/GFx/textbg{names[i]}.ozd");
+                    _nineSlice[i] = await TextureLoader.Instance.PrepareAndGetTexture($"Interface/GFx/textbg{s_nineSliceSuffixes[i]}.ozd");
                 }
             }
         }
 
         public override void OnFocus()
         {
+            if (IsFocused) return;
             base.OnFocus();
             IsFocused = true;
             _showCursor = true;
             _cursorBlinkTimer = 0;
             if (Scene != null) Scene.FocusControl = this;
-#if ANDROID
-            AndroidKeyboard.Show();
-#endif
+
+            _logger?.LogDebug("TextFieldControl: OnFocus called. Subscribing to TextInput.");
         }
 
         public override void OnBlur()
         {
+            if (!IsFocused) return;
             base.OnBlur();
             IsFocused = false;
             _showCursor = false;
             _cursorBlinkTimer = 0;
+
+            _logger?.LogDebug("TextFieldControl: OnBlur called. Unsubscribing from TextInput.");
+
 #if ANDROID
+            AndroidKeyboard.TextInput -= OnTextInput;
             AndroidKeyboard.Hide();
 #endif
         }
@@ -113,7 +140,7 @@ namespace Client.Main.Controls.UI
             }
         }
 
-        private void UpdateScrollOffset()
+        protected void UpdateScrollOffset()
         {
             if (GraphicsManager.Instance?.Font == null) return;
 
@@ -125,6 +152,94 @@ namespace Client.Main.Controls.UI
             _scrollOffset = textWidth > maxVisibleWidth ? textWidth - maxVisibleWidth : 0;
         }
 
+        protected void OnEnterKeyPressed()
+        {
+            EnterKeyPressed?.Invoke(this, EventArgs.Empty);
+        }
+
+        protected void OnValueChanged()
+        {
+            ValueChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// Handles text input on Android (from soft keyboard or scrcpy).
+        /// </summary>
+#if ANDROID
+        private void OnTextInput(object sender, Platform.Android.TextInputEventArgs e)
+        {
+            bool textChanged = false;
+
+            // Handle control keys by character or key code
+            if (e.Character == '\r' || e.Key == Keys.Enter)
+            {
+                EnterKeyPressed?.Invoke(this, EventArgs.Empty);
+                ValueChanged?.Invoke(this, EventArgs.Empty);
+                return; // Enter usually consumes the event
+            }
+            else if (e.Character == '\b' || e.Key == Keys.Back)
+            {
+                // Backspace - delete last character
+                if (_inputText.Length > 0)
+                {
+                    _inputText.Remove(_inputText.Length - 1, 1);
+                    textChanged = true;
+                }
+            }
+            else if (e.Character != '\0' && !char.IsControl(e.Character))
+            {
+                // Standard printable character input
+                _inputText.Append(e.Character);
+                textChanged = true;
+            }
+
+            if (textChanged)
+            {
+                UpdateScrollOffset();
+                MoveCursorToEnd();
+                ValueChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+#endif
+
+        public override void Update(GameTime gameTime)
+        {
+            base.Update(gameTime);
+
+            if (!IsFocused || !Visible) return;
+
+#if !ANDROID
+            // On non-Android platforms (Windows, Linux, Mac), use keyboard polling
+            var keysPressed = MuGame.Instance.Keyboard.GetPressedKeys();
+            bool shift = MuGame.Instance.Keyboard.IsKeyDown(Keys.LeftShift) || MuGame.Instance.Keyboard.IsKeyDown(Keys.RightShift);
+            bool capsLock = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows) ? Console.CapsLock : false;
+
+            bool textModifiedByKey = false;
+            foreach (var key in keysPressed)
+            {
+                if (MuGame.Instance.PrevKeyboard.IsKeyUp(key))
+                {
+                    ProcessKey(key, shift, capsLock);
+                    textModifiedByKey = true;
+                }
+            }
+
+            if (textModifiedByKey || (IsFocused && !MuGame.Instance.PrevKeyboard.GetPressedKeys().Any()))
+            {
+                UpdateScrollOffset();
+            }
+#endif
+
+            _cursorBlinkTimer += gameTime.ElapsedGameTime.TotalMilliseconds;
+            if (_cursorBlinkTimer >= CursorBlinkInterval)
+            {
+                _showCursor = !_showCursor;
+                _cursorBlinkTimer = 0;
+            }
+        }
+
+#if !ANDROID
+        // Keyboard input processing for Windows/Desktop platforms
         private void ProcessKey(Keys key, bool shift, bool capsLock)
         {
             bool textChanged = false;
@@ -152,6 +267,7 @@ namespace Client.Main.Controls.UI
             {
                 UpdateScrollOffset();
                 MoveCursorToEnd();
+                ValueChanged?.Invoke(this, EventArgs.Empty);
             }
         }
 
@@ -206,53 +322,28 @@ namespace Client.Main.Controls.UI
                 _ => '\0'
             };
         }
-
-        public override void Update(GameTime gameTime)
-        {
-            base.Update(gameTime);
-
-            if (!IsFocused || !Visible) return;
-
-            var keysPressed = MuGame.Instance.Keyboard.GetPressedKeys();
-            bool shift = MuGame.Instance.Keyboard.IsKeyDown(Keys.LeftShift) || MuGame.Instance.Keyboard.IsKeyDown(Keys.RightShift);
-            bool capsLock = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? Console.CapsLock : false;
-
-            bool textModifiedByKey = false;
-            foreach (var key in keysPressed)
-            {
-                if (MuGame.Instance.PrevKeyboard.IsKeyUp(key))
-                {
-                    ProcessKey(key, shift, capsLock);
-                    textModifiedByKey = true;
-                }
-            }
-
-            if (textModifiedByKey || (IsFocused && !MuGame.Instance.PrevKeyboard.GetPressedKeys().Any()))
-            {
-                UpdateScrollOffset();
-            }
-
-            _cursorBlinkTimer += gameTime.ElapsedGameTime.TotalMilliseconds;
-            if (_cursorBlinkTimer >= CursorBlinkInterval)
-            {
-                _showCursor = !_showCursor;
-                _cursorBlinkTimer = 0;
-            }
-        }
+#endif
 
         public override void Draw(GameTime gameTime)
         {
             if (Status != GameControlStatus.Ready || !Visible)
                 return;
 
-            var spriteBatch = GraphicsManager.Instance.Sprite;
+            using (new SpriteBatchScope(
+                GraphicsManager.Instance.Sprite,
+                SpriteSortMode.Deferred,
+                BlendState.AlphaBlend,
+                transform: UiScaler.SpriteTransform))
+            {
+                var spriteBatch = GraphicsManager.Instance.Sprite;
 
-            if (Skin == TextFieldSkin.NineSlice && _nineSlice[0] != null)
-                DrawNineSliceBackground(spriteBatch);
-            else
-                DrawFlatBackground(spriteBatch);
+                if (Skin == TextFieldSkin.NineSlice && _nineSlice[0] != null)
+                    DrawNineSliceBackground(spriteBatch);
+                else
+                    DrawFlatBackground(spriteBatch);
 
-            DrawTextAndCursor(spriteBatch);
+                DrawTextAndCursor(spriteBatch);
+            }
 
             base.Draw(gameTime);
         }
